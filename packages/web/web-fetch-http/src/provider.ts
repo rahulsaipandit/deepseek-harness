@@ -1,17 +1,29 @@
 /**
  * Safe HTTP(S) retrieval for `ctx.web`: validates URLs, follows only same-origin redirects,
- * enforces time and size limits, classifies and decodes text, and leaves presentation to
+ * enforces time and size limits, applies destination-IP policy after DNS resolution,
+ * pins each request hop to one validated resolved IP to reduce rebinding risk,
+ * classifies and decodes text, and leaves presentation to
  * `@deepseek-ai/dsh-tool-web`. Requests carry no browser cookies or ambient credentials.
- *
- * Private-network and SSRF protection is not implemented; do not enable this provider where
- * it can reach sensitive internal targets.
  * @module @deepseek-ai/dsh-web-fetch-http/provider
  */
 
 import { WebError } from '@deepseek-ai/dsh-web'
 import type { WebFetchBody, WebFetchProvider, WebFetchRequest, WebFetchResult } from '@deepseek-ai/dsh-web'
+import { request as httpRequest } from 'node:http'
+import { request as httpsRequest } from 'node:https'
+import { Readable } from 'node:stream'
 import { deadline, timeoutOf } from '@deepseek-ai/dsh-timeout'
-import { classifyContentType, decoderForCharset, isSameOrigin, parseCharset, validateFetchUrl } from './policy.ts'
+import {
+  classifyContentType,
+  compileDestinationAllowlist,
+  decoderForCharset,
+  isSameOrigin,
+  parseCharset,
+  resolveDestination,
+  validateFetchUrl,
+} from './policy.ts'
+import type { DestinationPolicyMode } from './policy.ts'
+import type { BlockList } from 'node:net'
 
 /** Resolved provider limits (the plugin's schemastery Config supplies defaults). */
 export interface HttpFetchLimits {
@@ -27,6 +39,10 @@ export interface HttpFetchLimits {
   maxRedirects: number
   /** `User-Agent` header sent on every request. */
   userAgent: string
+  /** Destination policy mode for resolved target IP addresses. */
+  destinationPolicyMode: DestinationPolicyMode
+  /** CIDR allowlist used when destination policy mode is `allowlist`. */
+  destinationAllowCidrs: readonly string[]
 }
 
 /** Stable id this provider registers under. */
@@ -35,8 +51,11 @@ export const LOCAL_FETCH_PROVIDER_ID = 'http'
 /** The anonymous public HTTP(S) fetch provider. */
 export class HttpFetchProvider implements WebFetchProvider {
   readonly id = LOCAL_FETCH_PROVIDER_ID
+  private readonly destinationAllowlist: BlockList
 
-  constructor(private readonly limits: HttpFetchLimits) {}
+  constructor(private readonly limits: HttpFetchLimits) {
+    this.destinationAllowlist = compileDestinationAllowlist(limits.destinationAllowCidrs)
+  }
 
   /** No credentials to check — an anonymous public fetcher is always usable. */
   available(): boolean {
@@ -58,7 +77,12 @@ export class HttpFetchProvider implements WebFetchProvider {
     let redirectsFollowed = 0
 
     for (;;) {
-      const response = await this.requestOnce(currentUrl, signal)
+      const destination = await resolveDestination(
+        currentUrl,
+        this.limits.destinationPolicyMode,
+        this.limits.destinationPolicyMode === 'allowlist' ? this.destinationAllowlist : undefined,
+      )
+      const response = await this.requestOnce(currentUrl, signal, destination.address, destination.family)
 
       if (isRedirectStatus(response.status)) {
         // Enforce the redirect budget before resolving or validating the next hop.
@@ -100,13 +124,48 @@ export class HttpFetchProvider implements WebFetchProvider {
     }
   }
 
-  private async requestOnce(url: URL, signal: AbortSignal): Promise<Response> {
+  private async requestOnce(url: URL, signal: AbortSignal, pinnedAddress: string, pinnedFamily: 4 | 6): Promise<Response> {
+    const requester = url.protocol === 'https:' ? httpsRequest : httpRequest
     try {
-      return await fetch(url, {
-        method: 'GET',
-        redirect: 'manual',
-        headers: { 'user-agent': this.limits.userAgent, 'accept': 'text/html,application/xhtml+xml,text/*;q=0.9,application/json;q=0.8' },
-        signal,
+      return await new Promise<Response>((resolve, reject) => {
+        const request = requester({
+          protocol: url.protocol,
+          hostname: url.hostname,
+          port: url.port === '' ? undefined : Number(url.port),
+          path: `${url.pathname}${url.search}`,
+          method: 'GET',
+          headers: {
+            'user-agent': this.limits.userAgent,
+            'accept': 'text/html,application/xhtml+xml,text/*;q=0.9,application/json;q=0.8',
+          },
+          servername: url.hostname,
+          signal,
+          // CLAUDE_FIX_SECURITY: Claude fixed DNS-rebinding risk by pinning this
+          // hop to one policy-validated resolved IP instead of allowing fresh
+          // resolver selection during socket connect.
+          lookup(_hostname, _opts, callback) {
+            callback(null, pinnedAddress, pinnedFamily)
+          },
+        }, (incoming) => {
+          const headers = new Headers()
+          for (const [key, raw] of Object.entries(incoming.headers)) {
+            if (raw === undefined) continue
+            if (Array.isArray(raw)) {
+              for (const value of raw) headers.append(key, value)
+              continue
+            }
+            headers.set(key, raw)
+          }
+          const body = incoming.statusCode === 204 || incoming.statusCode === 304
+            ? null
+            : Readable.toWeb(incoming) as unknown as ReadableStream<Uint8Array>
+          resolve(new Response(body, {
+            status: incoming.statusCode ?? 0,
+            headers,
+          }))
+        })
+        request.on('error', reject)
+        request.end()
       })
     } catch (error: unknown) {
       throw translateAbortOrNetwork(error, signal)

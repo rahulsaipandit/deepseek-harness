@@ -12,6 +12,36 @@ import { RpcId, type ClientRequest } from '@deepseek-ai/dsh-host-apiproxy/api'
 import type { WebServer, WebRoute, WebUpgradeRoute } from '@deepseek-ai/dsh-host-webserver'
 import { API_PATH, apply, HOST_EVENTS_PATH, inject, MUX_EVENTS_PATH, type HostConnectionHandle } from '../src/index.ts'
 
+const TEST_BEARER = 'Bearer test-remote-token'
+
+function isLoopbackHostHeader(host: string | undefined): boolean {
+  if (host === undefined) return false
+  try {
+    const parsed = new URL(`http://${host}`)
+    return parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1' || parsed.hostname === '::1'
+  } catch {
+    return false
+  }
+}
+
+function authHeaders(headers: Record<string, string>): Record<string, string> {
+  if (isLoopbackHostHeader(headers.host)) return headers
+  if (headers.authorization !== undefined) return headers
+  return { ...headers, authorization: TEST_BEARER }
+}
+
+/**
+ * Simulated TCP peer for a fake request: these fixtures build a bare
+ * `IncomingMessage` with no real socket, but `apply`'s trust gate now reads
+ * `req.socket.remoteAddress` (not the forgeable Host header) to decide
+ * whether a call is genuinely local. Deriving it from the test's own `host`
+ * header keeps every existing "loopback vs LAN/declared-authority" scenario
+ * simulating the peer it was written to represent.
+ */
+function socketFor(host: string | undefined): { remoteAddress: string } {
+  return { remoteAddress: isLoopbackHostHeader(host) ? '127.0.0.1' : '203.0.113.5' }
+}
+
 /** Structural webServer fake recording both route registries. */
 function fakeHttpServer(
   routes: WebRoute[],
@@ -37,21 +67,26 @@ function fakeHttpServer(
 /** Bodyless GET carrying the given headers (enough for the trust fence + bridge). */
 function fakeRequest(headers: Record<string, string>, url = `${API_PATH}/session.list`): IncomingMessage {
   const request = Readable.from([]) as unknown as IncomingMessage
-  Object.assign(request, { url, method: 'GET', headers })
+  Object.assign(request, { url, method: 'GET', headers: authHeaders(headers), socket: socketFor(headers.host) })
   return request
 }
 
 /** JSON POST carrying a complete client-request envelope. */
 function fakePost(headers: Record<string, string>, url: string, body: unknown): IncomingMessage {
   const request = Readable.from([Buffer.from(JSON.stringify(body))]) as unknown as IncomingMessage
-  Object.assign(request, { url, method: 'POST', headers: { 'content-type': 'application/json', ...headers } })
+  Object.assign(request, {
+    url,
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...authHeaders(headers) },
+    socket: socketFor(headers.host),
+  })
   return request
 }
 
 /** Raw POST for malformed-body and media-type boundary cases. */
 function fakeRawPost(headers: Record<string, string>, url: string, body: string): IncomingMessage {
   const request = Readable.from([Buffer.from(body)]) as unknown as IncomingMessage
-  Object.assign(request, { url, method: 'POST', headers })
+  Object.assign(request, { url, method: 'POST', headers: authHeaders(headers), socket: socketFor(headers.host) })
   return request
 }
 
@@ -74,7 +109,11 @@ function fakeResponse(): { response: ServerResponse; state: { status?: number; b
   return { response, state }
 }
 
-async function mounted(config?: { trustedHosts?: string[] }): Promise<{
+async function mounted(config?: {
+  trustedHosts?: string[]
+  remoteAuthMode?: 'none' | 'bearer'
+  remoteAuthTokens?: string[]
+}): Promise<{
   routes: WebRoute[]
   upgrades: WebUpgradeRoute[]
   dispose: () => Promise<void>
@@ -84,7 +123,14 @@ async function mounted(config?: { trustedHosts?: string[] }): Promise<{
   const upgrades: WebUpgradeRoute[] = []
   ctx.provide('webServer', fakeHttpServer(routes, upgrades) as WebServer)
   ctx.provide('apiProxy', {} as unknown as ApiProxy)
-  const fiber = ctx.plugin({ inject: [...inject], apply }, config)
+  const withAuth = config?.trustedHosts !== undefined && config.trustedHosts.length > 0
+    ? {
+      ...config,
+      remoteAuthMode: config.remoteAuthMode ?? 'bearer',
+      remoteAuthTokens: config.remoteAuthTokens ?? ['test-remote-token'],
+    }
+    : config
+  const fiber = ctx.plugin({ inject: [...inject], apply }, withAuth)
   await fiber.await()
   return { routes, upgrades, dispose: () => fiber.dispose() }
 }
@@ -162,7 +208,7 @@ describe('connection node half', () => {
   })
 
   it('pins privileged methods to loopback even for a declared trusted authority', async () => {
-    const { routes, dispose } = await mounted({ trustedHosts: ['harness.example'] })
+    const { routes, dispose } = await mounted({ trustedHosts: ['harness.example'], remoteAuthMode: 'bearer', remoteAuthTokens: ['test-remote-token'] })
     // The privileged set: native dialogs plus the whole settings/credential
     // configuration plane, reads included, plus the one method that makes the
     // host fetch a caller-chosen URL. The same declared authority reaches
@@ -264,7 +310,7 @@ describe('connection node half', () => {
     const routes: WebRoute[] = []
     ctx.provide('webServer', fakeHttpServer(routes, []) as WebServer)
     ctx.provide('apiProxy', {} as unknown as ApiProxy)
-    const fiber = ctx.plugin({ inject: [...inject], apply }, { trustedHosts: ['harness.example'] })
+    const fiber = ctx.plugin({ inject: [...inject], apply }, { trustedHosts: ['harness.example'], remoteAuthMode: 'bearer', remoteAuthTokens: ['test-remote-token'] })
     await fiber.await()
     const connection = ctx.get('connection') as HostConnectionHandle
     const calls: unknown[] = []
@@ -341,7 +387,7 @@ describe('connection node half', () => {
     const ctx = new Context()
     const routes: WebRoute[] = []
     ctx.provide('webServer', fakeHttpServer(routes, []) as WebServer)
-    const fiber = ctx.plugin({ inject: [...inject], apply }, { trustedHosts: ['harness.example'] })
+    const fiber = ctx.plugin({ inject: [...inject], apply }, { trustedHosts: ['harness.example'], remoteAuthMode: 'bearer', remoteAuthTokens: ['test-remote-token'] })
     await fiber.await()
     const connection = ctx.get('connection') as HostConnectionHandle
     const remove = connection.rpc.handle('/rpc', async (endpoint) => {
@@ -458,7 +504,7 @@ describe('connection node half over a real HTTP server', () => {
     // wire, not a hand-assembled object: the Host header a LAN browser sends
     // is exactly what decides loopback-only here, so the boundary is asserted
     // against the parse the server actually performs.
-    const { routes, dispose } = await mounted({ trustedHosts: ['harness.example'] })
+    const { routes, dispose } = await mounted({ trustedHosts: ['harness.example'], remoteAuthMode: 'bearer', remoteAuthTokens: ['test-remote-token'] })
     const { port, close } = await serve(routes)
     try {
       // Reads are as privileged as writes: describe returns the exposed

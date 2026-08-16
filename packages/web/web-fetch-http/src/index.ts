@@ -12,6 +12,7 @@ import z from '@deepseek-ai/schemastery'
 import type {} from '@deepseek-ai/dsh-web'
 import { HttpFetchProvider } from './provider.ts'
 import type { HttpFetchLimits } from './provider.ts'
+import type { DestinationPolicyMode } from './policy.ts'
 
 const MAX_NODE_TIMER_DELAY_MS = 2_147_483_647
 
@@ -44,6 +45,10 @@ export interface Config {
   maxRedirects?: number
   /** `User-Agent` header sent on every request. */
   userAgent?: string
+  /** Destination policy applied after DNS resolution for each request hop. */
+  destinationPolicyMode?: DestinationPolicyMode
+  /** CIDR allowlist used when `destinationPolicyMode` is `allowlist`. */
+  destinationAllowCidrs?: string[]
 }
 
 export const Config: z<Config> = z.object({
@@ -53,6 +58,11 @@ export const Config: z<Config> = z.object({
   timeoutMs: z.number().default(30_000),
   maxRedirects: z.number().default(5),
   userAgent: z.string().default(DEFAULT_USER_AGENT),
+  destinationPolicyMode: z.union([
+    z.const('block-private'),
+    z.const('allowlist'),
+  ]).default('block-private'),
+  destinationAllowCidrs: z.array(String).default([]),
 })
 
 /** Complete config after schemastery applies every field default. */
@@ -80,6 +90,12 @@ function assertNonNegativeInteger(name: string, value: number): void {
   }
 }
 
+function assertDestinationPolicy(config: ResolvedConfig): void {
+  if (config.destinationPolicyMode === 'allowlist' && config.destinationAllowCidrs.length === 0) {
+    throw new Error('web-fetch-http: destinationAllowCidrs must be non-empty in allowlist mode')
+  }
+}
+
 /** Register the local HTTP(S) fetch provider with `ctx.web`. */
 export function apply(ctx: Context, config: Config): void {
   // schemastery (Config) has already filled every defaulted field.
@@ -89,6 +105,7 @@ export function apply(ctx: Context, config: Config): void {
   assertPositiveFinite('maxBodyChars', resolved.maxBodyChars)
   assertTimeoutMs(resolved.timeoutMs)
   assertNonNegativeInteger('maxRedirects', resolved.maxRedirects)
+  assertDestinationPolicy(resolved)
   const limits: HttpFetchLimits = {
     maxUrlLength: resolved.maxUrlLength,
     maxResponseBytes: resolved.maxResponseBytes,
@@ -96,6 +113,8 @@ export function apply(ctx: Context, config: Config): void {
     timeoutMs: resolved.timeoutMs,
     maxRedirects: resolved.maxRedirects,
     userAgent: resolved.userAgent,
+    destinationPolicyMode: resolved.destinationPolicyMode,
+    destinationAllowCidrs: resolved.destinationAllowCidrs,
   }
   ctx.web.registerFetchProvider(new HttpFetchProvider(limits))
 }

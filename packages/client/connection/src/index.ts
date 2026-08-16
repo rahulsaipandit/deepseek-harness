@@ -1,4 +1,6 @@
 /** Host HTTP bridge for browser-client RPC. */
+import type { IncomingMessage } from 'node:http'
+import { timingSafeEqual } from 'node:crypto'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import type {} from '@deepseek-ai/dsh-attachment'
@@ -59,12 +61,104 @@ export interface ConnectionConfig {
   trustedHosts?: string[]
   /** Maximum buffered JSON body for every `/api` request. */
   maxRequestBodyBytes?: number
+  /** Non-loopback authentication mode for remote RPC traffic. */
+  remoteAuthMode?: 'none' | 'bearer'
+  /** Bearer tokens accepted for non-loopback traffic in bearer mode. */
+  remoteAuthTokens?: string[]
+  /** Header used for bearer auth (default: Authorization). */
+  remoteAuthHeader?: string
+  /** Fixed-window rate-limit window in milliseconds for non-loopback traffic. */
+  remoteRateLimitWindowMs?: number
+  /** Maximum accepted non-loopback requests per window per client key. */
+  remoteRateLimitMaxRequests?: number
 }
 
 export const Config: z<ConnectionConfig> = z.object({
   trustedHosts: z.array(String).default([]),
   maxRequestBodyBytes: z.natural().min(1).default(DEFAULT_MAX_REQUEST_BODY_BYTES),
+  remoteAuthMode: z.union([z.const('none'), z.const('bearer')]).default('none'),
+  remoteAuthTokens: z.array(String).default([]),
+  remoteAuthHeader: z.string().default('authorization'),
+  remoteRateLimitWindowMs: z.natural().min(1).default(60_000),
+  remoteRateLimitMaxRequests: z.natural().min(1).default(300),
 })
+
+type ResolvedConfig = Required<ConnectionConfig>
+
+interface RateWindow {
+  count: number
+  resetAt: number
+}
+
+class FixedWindowRateLimiter {
+  private readonly windows = new Map<string, RateWindow>()
+
+  constructor(private readonly windowMs: number, private readonly maxRequests: number) {}
+
+  take(key: string, now = Date.now()): boolean {
+    const current = this.windows.get(key)
+    if (current === undefined || now >= current.resetAt) {
+      this.windows.set(key, { count: 1, resetAt: now + this.windowMs })
+      return true
+    }
+    if (current.count >= this.maxRequests) return false
+    current.count += 1
+    return true
+  }
+}
+
+// CLAUDE_FIX_SECURITY: the Host header is client-supplied and trivially forged
+// (curl -H "Host: localhost" reaches a 0.0.0.0-bound server the same as any
+// other request) — checking it here would let a genuine remote attacker claim
+// loopback and skip the bearer-auth gate below entirely. Whether a connection
+// is actually local can only be judged from the OS-reported TCP peer address.
+function isLoopbackAddress(address: string): boolean {
+  if (address === '::1') return true
+  const v4 = address.startsWith('::ffff:') ? address.slice('::ffff:'.length) : address
+  const octets = v4.split('.')
+  return octets.length === 4
+    && octets[0] === '127'
+    && octets.every(octet => /^\d{1,3}$/.test(octet) && Number(octet) <= 255)
+}
+
+function isLoopbackConnection(req: IncomingMessage): boolean {
+  const remote = req.socket?.remoteAddress
+  return remote !== undefined && isLoopbackAddress(remote)
+}
+
+function extractBearer(value: string): string | undefined {
+  const match = /^Bearer\s+(.+)$/i.exec(value.trim())
+  return match?.[1]
+}
+
+// CLAUDE_FIX_SECURITY: compare with a timing-safe equality so a caller cannot
+// use response-time differences to guess a valid token byte-by-byte.
+function tokenEquals(candidate: string, presented: string): boolean {
+  const candidateBuf = Buffer.from(candidate)
+  const presentedBuf = Buffer.from(presented)
+  return candidateBuf.length === presentedBuf.length && timingSafeEqual(candidateBuf, presentedBuf)
+}
+
+function isAuthenticatedRemote(req: IncomingMessage, config: ResolvedConfig): boolean {
+  if (config.remoteAuthMode === 'none') return false
+  const raw = req.headers[config.remoteAuthHeader.toLowerCase()]
+  if (typeof raw !== 'string') return false
+  const token = extractBearer(raw)
+  if (token === undefined || token.length === 0) return false
+  return config.remoteAuthTokens.some(candidate => tokenEquals(candidate, token))
+}
+
+function remoteKey(req: IncomingMessage): string {
+  const peer = req.socket?.remoteAddress ?? 'unknown'
+  const host = typeof req.headers.host === 'string' ? req.headers.host : 'unknown'
+  return `${peer}|${host}`
+}
+
+/** The `/api/<method>` RPC method name a raw request path names, or undefined outside that prefix. */
+function requestMethodName(rawUrl: string | undefined): string | undefined {
+  const pathname = new URL(rawUrl ?? '/', 'http://internal').pathname
+  return pathname.startsWith(`${API_PATH}/`) ? pathname.slice(API_PATH.length + 1) : undefined
+}
 
 /**
  * Methods gated to loopback even on a trusted-host deployment. Native dialogs
@@ -129,13 +223,31 @@ const PRIVILEGED_METHODS = new Set([
  */
 export function apply(ctx: Context, config?: ConnectionConfig): void {
   // The Loader resolves schema defaults; hand-built test contexts may pass none.
-  const trustedHosts = config?.trustedHosts ?? []
-  const maxRequestBodyBytes = config?.maxRequestBodyBytes ?? DEFAULT_MAX_REQUEST_BODY_BYTES
+  const resolved = {
+    trustedHosts: config?.trustedHosts ?? [],
+    maxRequestBodyBytes: config?.maxRequestBodyBytes ?? DEFAULT_MAX_REQUEST_BODY_BYTES,
+    remoteAuthMode: config?.remoteAuthMode ?? 'none',
+    remoteAuthTokens: config?.remoteAuthTokens ?? [],
+    remoteAuthHeader: (config?.remoteAuthHeader ?? 'authorization').toLowerCase(),
+    remoteRateLimitWindowMs: config?.remoteRateLimitWindowMs ?? 60_000,
+    remoteRateLimitMaxRequests: config?.remoteRateLimitMaxRequests ?? 300,
+  } satisfies ResolvedConfig
+  const trustedHosts = resolved.trustedHosts
+  const maxRequestBodyBytes = resolved.maxRequestBodyBytes
   // Config boundary: a malformed entry fails the load loudly here rather than
   // silently authorizing its hostname prefix at request time.
   for (const entry of trustedHosts) assertTrustedAuthority(entry)
+  // CLAUDE_FIX_SECURITY: Claude fixed remote-RPC exposure risk by failing
+  // closed: any non-loopback deployment must declare auth.
+  if (trustedHosts.length > 0 && resolved.remoteAuthMode === 'none') {
+    throw new Error('client-connection: non-loopback trustedHosts require remote auth (set remoteAuthMode=bearer)')
+  }
+  if (resolved.remoteAuthMode === 'bearer' && resolved.remoteAuthTokens.length === 0) {
+    throw new Error('client-connection: remoteAuthTokens must be non-empty in bearer mode')
+  }
   if (ctx.get('apiProxy') !== undefined) assertImageBodyCapacity(ctx, maxRequestBodyBytes)
   const connection = new HostConnectionService(ctx, trustedHosts)
+  const remoteLimiter = new FixedWindowRateLimiter(resolved.remoteRateLimitWindowMs, resolved.remoteRateLimitMaxRequests)
   const fetchHandler = connection.createSharedFetchHandler(API_PATH, {
     async fetch(request) {
       const pathname = new URL(request.url).pathname
@@ -163,9 +275,41 @@ export function apply(ctx: Context, config?: ConnectionConfig): void {
     path: API_PATH,
     handler: async (req, res) => {
       if (!isTrustedApiRequest(req, trustedHosts)) {
+        if (!isLoopbackConnection(req)) {
+          ctx.logger.warn('remote-rpc audit: denied untrusted request host=%s remote=%s', req.headers.host ?? 'unknown', req.socket?.remoteAddress ?? 'unknown')
+        }
         res.writeHead(403)
         res.end('forbidden')
         return
+      }
+      if (!isLoopbackConnection(req)) {
+        if (!isAuthenticatedRemote(req, resolved)) {
+          ctx.logger.warn('remote-rpc audit: denied unauthenticated request host=%s remote=%s', req.headers.host ?? 'unknown', req.socket?.remoteAddress ?? 'unknown')
+          res.writeHead(401)
+          res.end('unauthorized')
+          return
+        }
+        if (!remoteLimiter.take(remoteKey(req))) {
+          ctx.logger.warn('remote-rpc audit: denied rate-limited request host=%s remote=%s', req.headers.host ?? 'unknown', req.socket?.remoteAddress ?? 'unknown')
+          res.writeHead(429)
+          res.end('too many requests')
+          return
+        }
+        // CLAUDE_FIX_SECURITY: the inner fetchHandler's PRIVILEGED_METHODS
+        // check below only inspects the (forgeable) Host header via
+        // isTrustedApiRequest, so a caller holding a valid bearer token could
+        // otherwise still spoof Host: localhost to reach settings/credentials
+        // methods documented as loopback-only. Pin them here against the real
+        // socket peer, which cannot be forged, before a bearer-authenticated
+        // remote caller ever reaches that inner check.
+        const requestMethod = requestMethodName(req.url)
+        if (requestMethod !== undefined && PRIVILEGED_METHODS.has(requestMethod)) {
+          ctx.logger.warn('remote-rpc audit: denied non-loopback privileged method=%s remote=%s', requestMethod, req.socket?.remoteAddress ?? 'unknown')
+          res.writeHead(403)
+          res.end('forbidden')
+          return
+        }
+        ctx.logger.info('remote-rpc audit: accepted request host=%s remote=%s method=%s url=%s', req.headers.host ?? 'unknown', req.socket?.remoteAddress ?? 'unknown', req.method ?? 'unknown', req.url ?? 'unknown')
       }
       await bridge(req, res, fetchHandler, maxRequestBodyBytes)
     },
@@ -182,9 +326,27 @@ export function apply(ctx: Context, config?: ConnectionConfig): void {
         path,
         handler: (req, socket, head) => {
           if (!isTrustedApiRequest(req, trustedHosts)) {
+            if (!isLoopbackConnection(req)) {
+              ctx.logger.warn('remote-rpc audit: denied untrusted websocket host=%s remote=%s path=%s', req.headers.host ?? 'unknown', req.socket?.remoteAddress ?? 'unknown', path)
+            }
             rejectWebSocketUpgrade(socket)
             return
           }
+          if (!isLoopbackConnection(req)) {
+            if (!isAuthenticatedRemote(req, resolved)) {
+              ctx.logger.warn('remote-rpc audit: denied unauthenticated websocket host=%s remote=%s path=%s', req.headers.host ?? 'unknown', req.socket?.remoteAddress ?? 'unknown', path)
+              rejectWebSocketUpgrade(socket)
+              return
+            }
+            if (!remoteLimiter.take(remoteKey(req))) {
+              ctx.logger.warn('remote-rpc audit: denied rate-limited websocket host=%s remote=%s path=%s', req.headers.host ?? 'unknown', req.socket?.remoteAddress ?? 'unknown', path)
+              rejectWebSocketUpgrade(socket)
+              return
+            }
+            ctx.logger.info('remote-rpc audit: accepted websocket host=%s remote=%s path=%s', req.headers.host ?? 'unknown', req.socket?.remoteAddress ?? 'unknown', path)
+          }
+          // CLAUDE_FIX_SECURITY: Claude fixed remote-RPC abuse risk by
+          // enforcing auth + rate limits before accepting non-loopback sockets.
           return handle(req, socket, head)
         },
       }), `client-connection: ${path} WebSocket`)

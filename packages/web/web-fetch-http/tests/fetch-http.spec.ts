@@ -15,6 +15,8 @@ const limits: HttpFetchLimits = {
   timeoutMs: 5_000,
   maxRedirects: 5,
   userAgent: 'test-agent/1.0',
+  destinationPolicyMode: 'allowlist',
+  destinationAllowCidrs: ['127.0.0.0/8'],
 }
 
 type Handler = (req: IncomingMessage, res: ServerResponse) => void
@@ -274,6 +276,16 @@ describe('HttpFetchProvider redirects', () => {
 })
 
 describe('HttpFetchProvider invalid URLs and abort', () => {
+  it('blocks loopback/private destination in block-private mode', async () => {
+    await expect(provider({ destinationPolicyMode: 'block-private', destinationAllowCidrs: [] }).fetch({ url: base }))
+      .rejects.toThrow(expect.objectContaining({ code: 'WEB_BLOCKED_URL' }))
+  })
+
+  it('rejects destination outside allowlist mode CIDRs', async () => {
+    await expect(provider({ destinationPolicyMode: 'allowlist', destinationAllowCidrs: ['10.0.0.0/8'] }).fetch({ url: base }))
+      .rejects.toThrow(expect.objectContaining({ code: 'WEB_BLOCKED_URL' }))
+  })
+
   it('rejects a non-http scheme before any network access', async () => {
     await expect(provider().fetch({ url: 'ftp://example.com' }))
       .rejects.toThrow(expect.objectContaining({ code: 'WEB_INVALID_URL' }))
@@ -371,7 +383,10 @@ describe('web-fetch-http plugin registration', () => {
   it('registers the provider into ctx.web (HMR-safe)', async () => {
     const ctx = new Context()
     await ctx.plugin(WebRuntime, { fetchProvider: LOCAL_FETCH_PROVIDER_ID })
-    const fiber = await ctx.plugin(fetchPlugin, {})
+    const fiber = await ctx.plugin(fetchPlugin, {
+      destinationPolicyMode: 'allowlist',
+      destinationAllowCidrs: ['127.0.0.0/8'],
+    })
     await expect(ctx.web.fetch({ url: `${base}/` }))
       .resolves.toMatchObject({ statusCode: 200 })
     await fiber.dispose()
@@ -416,6 +431,15 @@ describe('web-fetch-http plugin registration', () => {
     await ctx.plugin(WebRuntime, { fetchProvider: LOCAL_FETCH_PROVIDER_ID })
     await expect(ctx.plugin(fetchPlugin, { maxRedirects: -1 }))
       .rejects.toThrow(/maxRedirects must be a non-negative integer/)
+  })
+
+  it('rejects allowlist mode without destinationAllowCidrs', async () => {
+    const ctx = new Context()
+    await ctx.plugin(WebRuntime, { fetchProvider: LOCAL_FETCH_PROVIDER_ID })
+    await expect(ctx.plugin(fetchPlugin, {
+      destinationPolicyMode: 'allowlist',
+      destinationAllowCidrs: [],
+    })).rejects.toThrow(/destinationAllowCidrs must be non-empty/)
   })
 
   it('accepts maxRedirects: 0 (follow no redirects) as valid config', async () => {
