@@ -30,6 +30,7 @@ use three tiers: **good/useful** (usable as-is), **usable with caution**
 | [DSH_plugins_4U — wechat](#dsh_plugins_4u) | WeChat bridge | Usable with caution / lean avoid |
 | [dsh-workbench](#dsh-workbench) | File explorer/diff panel | **Avoid as-is (real vulnerability)** |
 | [flight-search](#new-plugin-flight-search) (ours, new) | Flight-price lookup tool | Our own hardened port — see design + implementation |
+| [vision-bridge](#new-plugin-vision-bridge) (ours, new) | Image-to-text bridge | Our own hybrid of visionDS + dsh-plugin-mm-vision — see design + implementation |
 
 ---
 
@@ -787,6 +788,99 @@ Lives at `dsh-plugins/flight-search/` — see `dsh-plugins/README.md` for why
 this plugin folder is kept isolated from `packages/` (these are our own
 plugins, reviewed and maintained on the same bar as the third-party review
 above, not part of the core harness's own build/release graph).
+
+## New plugin: vision-bridge
+
+Status: designed here, implemented at `dsh-plugins/vision-bridge/` — our own
+plugin, a deliberate hybrid of [visionDS](#visionds) and
+[dsh-plugin-mm-vision](#dsh-plugin-mm-vision) above, built to keep what each
+one got right and drop what each one got wrong.
+
+**Source basis:** the two community reviews earlier in this doc, plus this
+repo's own `read_image` tool (`packages/fs/tool-fs/src/read-image.ts`) as
+the reference for how a model-facing image argument should resolve a local
+path — through `ctx.fs`, not raw `node:fs`.
+
+### What was kept, and from which plugin
+
+| Concern | Kept from | Why |
+|---|---|---|
+| Tool shape | dsh-plugin-mm-vision | Register as a schema-scoped `ctx.tools` tool (`{ file_path?, url?, prompt?, mode? }`), never a shell-invoked skill. The model can never supply a destination URL or credential — closing exactly the gap visionDS's `--base-url`/`--api-key`-accepting skill script left open. |
+| Provider strategy | visionDS | A configurable multi-provider catalog (MiMo/GLM/Ark/DashScope/Moonshot/OpenAI-compatible, `src/providers.ts`), tried in a configurable priority order, with the same credential-ref names visionDS's `.env.example` documents so an existing deployment's keys carry over unchanged. |
+| Offline fallback | visionDS | Windows (WinRT `OcrEngine`) and macOS (Vision framework) OCR when no provider succeeds — free, no key required. Ported in spirit, not copied: reimplemented as fixed `execFile` argv (`src/local-ocr.ts`), never a shell string, and with no model-facing override of which script or arguments run. |
+| Description format | dsh-plugin-mm-vision | The structured, coordinate-annotated prompt (canvas/elements/percentage-coordinates/relationships, `src/prompt.ts`) — a real quality win over visionDS's plain "describe this image," reimplemented rather than copied. |
+| Response caching | dsh-plugin-mm-vision | An in-memory TTL cache (`src/cache.ts`), keyed by a hash of the actual image bytes + prompt rather than a raw input string, so a local path and a URL resolving to the same picture still share a cache entry. |
+
+### What was fixed relative to both
+
+- **The image source is never an arbitrary local path read via raw
+  `node:fs`.** Both reviewed plugins read any string the model supplied as
+  a filesystem path directly (`os.path`/Python `open()` in visionDS,
+  `path.resolve()` + `fs.readFileSync` in dsh-plugin-mm-vision) with no
+  sandboxing and no confinement. `src/image-source.ts`'s
+  `resolveImageFromPath()` instead goes through `ctx.fs.resolve()` /
+  `ctx.fs.stat()` / `ctx.fs.readBytes()` — the same sandboxed,
+  policy-aware seam `read_image` uses — so filesystem policy (not this
+  plugin) decides what's reachable.
+- **Every source is magic-byte sniffed, and anything that doesn't match is
+  refused outright.** visionDS fell back to labeling unrecognized bytes
+  `application/octet-stream` and sent them anyway; dsh-plugin-mm-vision
+  defaulted unrecognized extensions to `image/png` and did the same. Here,
+  `sniffImageMediaType()` recognizes PNG/JPEG/GIF/WebP/BMP by header bytes
+  only, and both `resolveImageFromPath()`/`resolveImageFromUrl()` throw
+  `ImageSourceError` on anything else — failing closed rather than shipping
+  an arbitrary file's bytes under a fake label.
+- **A remote source must be `https`, checked before any fetch is
+  attempted** (`resolveImageFromUrl()`), matching this repo's own
+  `flight-search` fetch discipline (bounded timeout via `AbortController`,
+  a declared-`content-length` check plus an actual-byte-count check against
+  `maxImageBytes`, never an unbounded buffer).
+- **No model-reachable destination or credential override, anywhere.** The
+  tool schema (`src/index.ts`) exposes only `file_path`/`url`/`prompt`/`mode`
+  — no `base_url`, no `api_key`, no arbitrary CLI-flag pass-through the way
+  visionDS's skill script had. `providers`/`providerOrder` are
+  plugin-config-only, resolved once at `apply()` time, never per-call
+  arguments.
+- **No implicit cross-tool credential fallback.** dsh-plugin-mm-vision's
+  `resolveApiKey()` would silently reuse the first `{key: string}` found
+  anywhere in `~/.pi/auth.json` if no name-matched entry existed. Here,
+  every provider's key resolves through exactly one named
+  `ctx.credentials` reference (`credentialRef(provider.credentialRef)`) —
+  an unconfigured provider is skipped, never backed by a guess.
+- **Fails loud, not silent, when nothing works.** If every provider fails
+  (or none has a configured credential) and offline OCR also fails or is
+  disabled, `execute()` throws a clear, specific error identifying what was
+  tried and why it didn't work — never a corrupted or empty "success."
+
+### Trust and limitations (disclosed up front, same posture as flight-search's)
+
+- The default provider catalog's endpoints/models are a snapshot of what
+  visionDS documented at review time; a provider may change its request/
+  response shape without notice. A response that doesn't parse as an
+  OpenAI-style `choices[0].message.content` is treated as that provider
+  failing (falls through to the next provider, then to OCR), never as a
+  silent empty success — the same fail-closed posture flight-search's
+  `AF_initDataCallback` parsing uses for an equally undocumented shape.
+  Unlike flight-search, though, every provider here is a documented,
+  officially supported chat-completions API (MiMo/GLM/Ark/DashScope/
+  Moonshot/OpenAI), not a reverse-engineered internal endpoint — there is
+  no ToS/stability caveat comparable to flight-search's or the WeChat
+  bridge's.
+- Local OCR has no Linux backend (`detectOcrPlatform()` returns `undefined`
+  there); on Linux, a deployment with no vision-provider credential
+  configured gets a clear "no provider had a configured credential, and
+  offline OCR fallback is disabled/unavailable" error rather than a silent
+  no-op.
+- See the plugin's own README (`dsh-plugins/vision-bridge/README.md`) for
+  the full config surface and credential-ref mapping.
+
+### Implementation
+
+Lives at `dsh-plugins/vision-bridge/` — same isolated-folder rationale as
+[flight-search](#new-plugin-flight-search) (`dsh-plugins/README.md`): a
+standalone npm package, own tests, no reliance on this repo's pnpm
+workspace, reviewed and maintained on the same bar as the third-party
+plugins reviewed above.
 
 ## Recommendation for the isolated-folder reimplementation
 

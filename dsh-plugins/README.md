@@ -26,6 +26,12 @@ without depending on this monorepo's internal build.
   `docs/adr/rp_dshPlugin_imChat.md` for the design, the community plugins it
   learned from without adopting wholesale, and current adapter status
   (Telegram and Slack implemented against mock APIs, WhatsApp deferred).
+- **[vision-bridge](./vision-bridge/)** — gives a text-only main model a way
+  to describe images (`describe_image` tool): a configurable multi-provider
+  vision-API catalog with offline OCR fallback. A deliberate hybrid of two
+  community plugins reviewed in `docs/adr/rp_dshPlugins.md` (visionDS,
+  dsh-plugin-mm-vision) — see its README and that doc's design section for
+  what was kept from each and what was fixed.
 
 ## Conventions these plugins follow
 
