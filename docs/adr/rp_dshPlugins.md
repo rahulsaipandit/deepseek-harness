@@ -19,7 +19,9 @@ use three tiers: **good/useful** (usable as-is), **usable with caution**
 | [DSH_plugins_4U — wallpaper](#dsh_plugins_4u) | Web UI cosmetic | Good/useful |
 | [dsh-plugin (loongsuite)](#dsh-plugin-loongsuite-observability) | Observability (OTel) | Usable with caution |
 | [dsh-browser](#dsh-browser) | Browser automation (Chrome ext.) | Usable with caution |
-| [DSH_plugins_4U — vision](#dsh_plugins_4u) | Image-to-text bridge | Usable with caution |
+| [DSH_plugins_4U — vision](#dsh_plugins_4u) | Image-to-text bridge (scoped route) | Usable with caution |
+| [visionDS](#visionds) | Image-to-text bridge (skill scripts) | Usable with caution |
+| [dsh-plugin-mm-vision](#dsh-plugin-mm-vision) | Image-to-text bridge (scoped tool) | Usable with caution |
 | [dsh-logistics-tracker](#dsh-logistics-tracker) | Courier tracking tool | Usable with caution |
 | [dsh-vscode](#dsh-vscode) | VS Code chat client | Usable with caution |
 | [deepseek-harness-vsc-extension](#deepseek-harness-vsc-extension) | VS Code chat client | Usable with caution |
@@ -554,6 +556,168 @@ directly; wallpaper injects CSS at runtime via `webServer.tapIndex` rather
 than patching built client files (`index.mjs:229-233`); `README.md:191` and
 `docs/DSH_PLUGIN_SPEC.md:117` explicitly state plugins extend only through
 public Cordis services/routes/slots, never DSH build artifacts.
+
+---
+
+## visionDS
+
+Source: https://github.com/deveuper/visionDS
+
+**What it does:** A four-skill bundle (`vision-ds`, `vision-ds-local`,
+`vision-ds-api`, `vision-setting`) that gives a text-only main model
+(DeepSeek, etc.) a way to "see" an image, addressing a real gap in this
+repo: the core `ctx.llm` seam is multimodal-ready (`ImageBlock`,
+`inputModalities`, [docs/subsystems/llm-streaming.md](../subsystems/llm-streaming.md#content-blocks-and-messages))
+but `dsh-llm-deepseek` rejects image content outright at the adapter level.
+`index.js:40-44` registers the four `SKILL.md` files
+through `ctx.skills` (`inject = ['skills']`); each is markdown instructing
+the agent to invoke a shared Python script,
+`skills/vision-ds/scripts/vision_hub.py` (574 lines), via its own shell
+tools. The script posts the image to a configurable OpenAI-compatible
+vision API (MiMo, GLM, 豆包/Ark, Qwen-VL/DashScope, Moonshot, OpenAI-compatible,
+Ollama, LM Studio — `skills/vision-ds/config/providers.json:1-98`), and
+falls back to local Windows (`ocr_windows.ps1`, WinRT OCR) or macOS
+(`ocr_macos.swift`) OCR on failure or a ~2-minute timeout.
+
+**Code quality:** Single upload commit, no tests/CI. The script itself is
+clean, single-purpose, and defensive in the ways it tries to be: magic-byte
+image sniffing (`vision_hub.py:61-77`), a 50MB size cap
+(`vision_hub.py:27,217-223`), transient-failure retry-then-fallback logic
+(`vision_hub.py:362-442`), and local-OCR `subprocess.run` calls that use
+argument lists, never `shell=True` (`vision_hub.py:317-325`) — no shell-injection
+surface in the OCR path. API keys are never hardcoded; resolution order is
+CLI flag → env var → user config.json → `.env` file
+(`vision_hub.py:162-179`), matching the credential-resolution pattern this
+review has praised elsewhere. One gap relative to
+[dsh-logistics-tracker](#dsh-logistics-tracker) and dsh-browser: the
+persisted `config.json`/`.env` holding API keys is written with no
+restrictive permissions (`vision_hub.py:94-99`, no `chmod`/0600).
+
+**Security — the design-level concern, not a code bug:**
+- **The skill is a shell script the model itself invokes with free-form
+  CLI flags, not a schema-scoped `ctx.tools` tool.** `SKILL.md` only
+  *suggests* the canonical invocation (`vision-ds/SKILL.md:14-16`:
+  `python vision_hub.py "<image path>" --timeout 110 --no-retry`), but
+  nothing constrains the agent to those flags. `vision_hub.py` also accepts
+  `--base-url` and `--api-key` overrides that take precedence over every
+  configured provider (`vision_hub.py:162-201`, `api_key_for`/`base_url_for`
+  check `explicit` first), and the positional image argument accepts **any
+  local path**, not just real images or attachment-store paths — a file
+  that fails every magic-byte/extension check still gets read, size-checked,
+  and base64-encoded, just tagged `application/octet-stream`
+  (`vision_hub.py:211-224`). Put together: if the agent is ever induced
+  (prompt injection from a fetched page, a file it was asked to summarize,
+  etc.) to call this script with an attacker-chosen `--base-url`/`--api-key`
+  and a locally-readable path already in its context (not necessarily one
+  the user pasted as an image), the file's bytes leave the machine to that
+  endpoint. This is the documented interface working as designed, not a
+  parsing bug — the fix is scoping vision skills like this behind a
+  `ctx.tools` schema that never exposes a destination URL or credential to
+  the model (the pattern [dsh-plugin-mm-vision](#dsh-plugin-mm-vision) below
+  actually uses).
+- **The plugin's own companion doc proposes a core-harness patch that would
+  make that path easier to reach.**
+  `docs/dsh-image-warning-fix.md` documents a fork
+  (`deveuper/deepseek-harness@fix/text-only-model-image-admission`, not
+  merged into this project's `master`) that removes the admission-time
+  rejection of images sent to text-only models in
+  `packages/host/apiproxy/src/api-proxy.ts`, replacing the rejected image
+  block with the durably-stored attachment's **local absolute file path**
+  as ordinary visible text (via a proposed `AttachmentStore.imagePath()`),
+  specifically so a skill like this one can pick it up. The doc frames this
+  as preserving the "model-visible ⟺ logged" invariant ([architecture.md](../architecture.md#session-log))
+  because the durable message stays text — which is true — but it does mean
+  any image the user pastes becomes a filesystem path sitting in the
+  model's own context, one step away from being handed to a script that
+  accepts an attacker-choosable exfiltration target. Worth tracking if this
+  fork is ever proposed against this repository directly; it is not part of
+  this review's included plugin, only linked from it.
+
+**Verdict: usable with caution.** No malicious code, no hardcoded secrets,
+correct provider/credential resolution, and the local-OCR subprocess calls
+are injection-safe. The real risk is architectural: implementing vision as
+an unrestricted shell skill instead of a scoped tool hands the model both
+an arbitrary local file read and an attacker-choosable upload destination
+the moment it can be prompt-injected into using them, and the author's own
+proposed harness patch would make that reachable from an ordinary pasted
+image. Fine to study for the provider-config/fallback pattern; if adopting,
+strip the `--base-url`/`--api-key` overrides and confine the image argument
+to the attachment store before exposing it to a model that can act on
+untrusted content.
+
+---
+
+## dsh-plugin-mm-vision
+
+Source: https://github.com/Elohia/dsh-plugin-mm-vision (ported from the
+multi-host [pi-mm-vision](https://github.com/Elohia/pi-mm-vision) project)
+
+**What it does:** Registers one model-facing tool, `mm_vision` (the
+"Synesthesia Encoder"), that converts an image into a compact,
+coordinate-annotated text description (canvas aspect/color, per-element
+`type | x%,y% | size% | color | text/value` rows, chart-vs-photo auto mode,
+an optional pixel-grid "reconstruction" mode) so a text-only model can
+reason about charts, screenshots, and photos. `lib/index.js:43-66` registers
+it via `ctx.tools.register(...)` (`inject = ['tools']`) with a fixed JSON
+schema — `{ image: string, prompt?: string }`, both required to be strings
+(`lib/index.js:28-41,54-56`) — and delegates to the zero-dependency
+`lib/core.js`, which posts to any OpenAI-compatible vision endpoint
+(default `qwen-vl-max` via DashScope, `lib/core.js:24-37`).
+
+**Code quality:** Single commit, no test suite (`verify.mjs` is a manual
+smoke script, not CI), no CI workflow found. Otherwise clean: small,
+well-commented, genuinely zero runtime dependencies
+(`package.json:41` — `dependencies: {}`, matching the file's own "零依赖"
+claim and the pattern [dsh-usage-chart](#dsh-usage-chart) was praised for),
+in-memory response caching keyed by a SHA-256 of the image content
+(`lib/core.js:200-223`), and a Python helper for an optional ASCII
+dot-matrix mode invoked via `execFile('python', [...])` with the image
+passed over **stdin**, not argv (`lib/core.js:234-253`) — the safer of the
+two subprocess patterns seen across this review, and explicitly commented
+as chosen to avoid command-line length limits.
+
+**Security:**
+- **Correct scoping, unlike visionDS above.** The model can only ever
+  supply `image` and `prompt` — there is no tool parameter for base URL or
+  API key, so a prompt-injected model cannot redirect where an analyzed
+  image is sent; `baseUrl`/`apiKey` are fixed at plugin-configuration time
+  only (`cordis.patch.yml` config fields or environment/`auth.json`,
+  `lib/core.js:63-111`), never per-call. This is the pattern visionDS's
+  skill-script design should have used.
+- **Image path is still unconfined and untyped, but the destination is
+  fixed.** `normalizeImage()` resolves any string that isn't a URL/data-URI
+  as a local path via `path.resolve()` and reads it if it exists, defaulting
+  to `image/png` for any unrecognized extension with no magic-byte check and
+  no size cap (`lib/core.js:127-137`). A model that can be induced to call
+  `mm_vision` with an arbitrary local path (an SSH key, a config file with
+  secrets, anything readable) will have those bytes base64'd, mislabeled as
+  a PNG, and POSTed to whatever vision endpoint is configured — but only to
+  that host-fixed endpoint (default `dashscope.aliyuncs.com`), not an
+  attacker-chosen one, which bounds the impact well below visionDS's
+  equivalent gap.
+- **Credential fallback can silently reuse an unrelated key.** Beyond its
+  own env vars, `resolveApiKey()` also reads `~/.pi/auth.json` — another
+  tool's credential file — and if no name-matched entry (`/vision|qwen|ali|dash|vl|token|gemini/i`)
+  is found, falls back to **the first `{key: string}` value found anywhere
+  in that file, regardless of name** (`lib/core.js:79-111`, specifically
+  the unguarded loop at `:105-107`). On a machine that also has some other
+  tool's `~/.pi/auth.json` present, this can silently send an unrelated
+  stored credential to the configured vision endpoint as a bearer token,
+  without the plugin ever declaring that it reads that file. Not an
+  exfiltration path by itself (destination is still host-configured), but a
+  credential-confusion foot-gun worth disabling by setting `apiKey`
+  explicitly rather than relying on discovery.
+- No hardcoded secrets; no outbound calls beyond the one configured vision
+  endpoint and the local `python` invocation for the optional dot-matrix
+  mode.
+
+**Verdict: usable with caution.** The tool-scoping choice (fixed schema, no
+model-controllable destination or credential) is the right reference
+pattern for any future vision bridge in this repo — notably safer than
+visionDS's shell-skill design reviewed above. Residual gaps: no
+confinement of the `image` path to the attachment store (bounded by a fixed
+destination, unlike visionDS), the silent `~/.pi/auth.json` first-key
+fallback, and no tests/CI/maintenance history to lean on yet.
 
 ---
 
