@@ -29,8 +29,10 @@ use three tiers: **good/useful** (usable as-is), **usable with caution**
 | [dsh-desktop-zero](#dsh-desktop-zero) | Electron desktop wrapper | Usable with caution |
 | [DSH_plugins_4U — wechat](#dsh_plugins_4u) | WeChat bridge | Usable with caution / lean avoid |
 | [dsh-workbench](#dsh-workbench) | File explorer/diff panel | **Avoid as-is (real vulnerability)** |
+| [skillhub (cocofhu)](#skillhub-cocofhu) | Skill marketplace search/install | Usable with caution |
 | [flight-search](#new-plugin-flight-search) (ours, new) | Flight-price lookup tool | Our own hardened port — see design + implementation |
 | [vision-bridge](#new-plugin-vision-bridge) (ours, new) | Image-to-text bridge | Our own hybrid of visionDS + dsh-plugin-mm-vision — see design + implementation |
+| [skillhub](#new-plugin-skillhub) (ours, new) | Skill marketplace search/install | Our own hardened redesign of skillhub (cocofhu) — see design + implementation |
 
 ---
 
@@ -722,6 +724,87 @@ fallback, and no tests/CI/maintenance history to lean on yet.
 
 ---
 
+## skillhub (cocofhu)
+
+Source: https://github.com/cocofhu/skillhub
+
+**What it does:** A DSH plugin that registers tools/commands for browsing a
+skill marketplace by category, installing a skill as a ZIP download
+extracted into the local skill directory, listing installed skills (by
+reading each `SKILL.md`'s frontmatter), uninstalling one, and a self-update
+path that checks GitHub Releases for a newer version of the plugin itself
+and reinstalls it via `npx --yes @deepseek-ai/dsh plugin ... add [spec]`.
+
+**Review basis:** unlike the other entries in this document, this plugin was
+not cloned and read in full; it was reviewed from its published source files
+on GitHub (`src/api.ts`, `src/install.ts`, `src/unzip.ts`, `src/http.ts`,
+`src/self-update.ts`, `src/config-store.ts`, `src/host.ts`,
+`src/skill-detail.ts`) at the time of this review, without building or
+running it. Findings below cite file/function names, not line numbers, and
+should be treated as a first pass, not the same-depth audit the rest of this
+document gives.
+
+**Code quality:** A real test suite exists (`src/tests/*.test.ts`, one file
+per module, plus `src/tests/helpers/zip.ts` and a fixture), CI
+(`.github/workflows/ci.yml`, a pack-check script), and community-project
+scaffolding (`SECURITY.md`, `CONTRIBUTING.md`, `CHANGELOG.md`,
+`CODE_OF_CONDUCT.md`) — better-maintained-looking than most single-commit
+entries in this review. `src/unzip.ts` hand-rolls a ZIP central-directory
+parser (magic numbers `0x04034b50`/`0x02014b50`/`0x06054b50`, `stored` and
+`deflate` via `zlib.inflateRawSync`) rather than pulling in a ZIP dependency
+— the same "small auditable hand-written implementation over a heavy
+library" instinct this review has praised elsewhere
+([dsh-usage-chart](#dsh-usage-chart), [dsh-plugin-mm-vision](#dsh-plugin-mm-vision)).
+
+**Security:**
+- **Zip-slip defense exists and looks reasonable.** `src/install.ts`'s
+  `safeRelPath()` rejects entry paths starting with `/` or containing `..`;
+  `skillDir()` additionally re-validates via `relative()` that the resolved
+  directory doesn't escape the skills root — two independent checks, the
+  same discipline this review's own hardened redesign below uses. No
+  evidence of a decompression-bomb guard (a total-uncompressed-size or
+  per-file-count cap) in what was reviewed, though the review did not
+  confirm its absence by running a crafted archive against it.
+- **`src/http.ts` performs no URL validation of any kind** — the reviewer's
+  own reading found no protocol allowlist, no private-IP/loopback/metadata-
+  address blocking, and no origin-pinning on redirects; `fetchJson`/
+  `fetchBytes` pass a URL straight to `fetch()`. This matters because
+  `src/install.ts`'s `downloadSkillFiles()` fetches a download URL that
+  presumably comes from the registry API's own response — if that URL is
+  ever attacker-influenced (a compromised registry, a malicious/typosquatted
+  skill entry, a MITM'd registry response over an unpinned connection), this
+  client has no destination policy to catch it, the same SSRF-shaped gap
+  this repo's own `dsh-web-fetch-http` package explicitly fixed
+  (`packages/web/web-fetch-http/src/policy.ts`).
+- **Self-update has no signature/checksum verification.**
+  `src/self-update.ts` fetches `https://api.github.com/repos/<PLUGIN_REPO>/releases/latest`,
+  then runs `npx --yes @deepseek-ai/dsh plugin --profile web add <spec>` for
+  the new release tag — no cryptographic signature check, no checksum
+  comparison, full trust in GitHub's transport security and npm's own
+  resolution. This is the same class of gap flagged for
+  [dsh-desktop](#dsh-desktop)'s unverified Node/`dsh` downloads, here applied
+  to the plugin auto-updating itself.
+- No hardcoded secrets found in the reviewed files; `parseVersion()`
+  constrains version strings to a narrow alphanumeric-plus-`._-+` charset
+  (max 32 chars), a sensible input bound wherever a version string reaches a
+  shell or path.
+
+**Verdict: usable with caution.** Zip-slip handling and version-string
+validation look sound from the source read; genuinely worse than this
+review's usual bar on two points — the total absence of any URL/destination
+validation in `http.ts`, and an unverified self-update path that executes an
+install command from unauthenticated release metadata. Neither is a
+demonstrated exploit (this review did not build/run the plugin or craft a
+malicious registry response), but both are the kind of gap this document has
+called out as a real risk elsewhere, not a hypothetical one. Our own
+redesign below (`dsh-plugins/skillhub/`) exists specifically to close both:
+no self-update at all, and every registry request URL assembled from the
+configured origin plus fixed paths — never from a response field — so there
+is no destination for a compromised response to redirect to in the first
+place.
+
+---
+
 ## New plugin: flight-search
 
 Status: designed here, implemented at `dsh-plugins/flight-search/` (see
@@ -879,6 +962,119 @@ path — through `ctx.fs`, not raw `node:fs`.
 Lives at `dsh-plugins/vision-bridge/` — same isolated-folder rationale as
 [flight-search](#new-plugin-flight-search) (`dsh-plugins/README.md`): a
 standalone npm package, own tests, no reliance on this repo's pnpm
+workspace, reviewed and maintained on the same bar as the third-party
+plugins reviewed above.
+
+## New plugin: skillhub
+
+Status: designed here, implemented at `dsh-plugins/skillhub/` — our own
+plugin, a hardened redesign of [skillhub (cocofhu)](#skillhub-cocofhu)
+above, built to keep its useful surface (search/install/list/uninstall
+skills from a registry) while closing the two gaps that review flagged and
+adding defenses the original didn't have at all.
+
+**Source basis:** the review above, plus this repo's own
+`docs/subsystems/skills.md` (the existing `.dsh/skills` discovery
+convention this plugin installs into, so nothing new has to discover an
+installed skill) and `packages/web/web-fetch-http/src/policy.ts` (the
+same-origin/no-redirect discipline this design generalizes from a single
+fetch policy into "never treat a response field as a fetch destination" at
+the client-construction level).
+
+### What was kept
+
+| Concern | Kept from cocofhu/skillhub | Notes |
+|---|---|---|
+| Tool surface | Search / install / list / uninstall, as four operations | Same shape, reimplemented as four schema-scoped `ctx.tools` (`skillhub_search`/`_install`/`_list`/`_uninstall`), matching this repo's own `defineTool` convention rather than the original's CLI/command-shaped interface. |
+| Zip-slip discipline | Two independent path checks (lexical rejection of `..`/absolute paths, then a resolved-path containment re-check) | Reimplemented in `install-path.ts`'s `assertSafeSkillRelativePath()` + `resolveWithinSkillDir()`/`resolveSkillDir()` — the same two-layer idea, applied to both the file-relative-path level and the skill-directory level. |
+| Version-string bound | A narrow charset + length cap on version strings | Reimplemented as `assertVersionString()` in `registry-client.ts`, same grammar. |
+| Hand-written implementation over a dependency | `src/unzip.ts`'s own ZIP parser instead of a library | Taken further here: no archive parser at all is needed (see below), so there's no ZIP-parsing surface to hand-write or audit in the first place. |
+
+### What was fixed, and why
+
+- **No archive download/extraction, at all.** The reviewed original
+  downloads a ZIP and extracts it (`src/unzip.ts`, `src/install.ts`); this
+  plugin's registry contract (`registry-client.ts`) is instead an itemized
+  JSON list of `{ path, content }` UTF-8 text files. This isn't a hardened
+  ZIP path — it's the deliberate removal of an entire vulnerability class
+  (zip-slip via crafted entry names, decompression bombs via a small file
+  that inflates to gigabytes, binary payloads smuggled past a naive
+  content-type check) rather than defending against each member of that
+  class individually. The tradeoff is real and disclosed: a registry
+  operator implementing this contract has to serve an itemized manifest, not
+  just proxy a GitHub release ZIP unchanged.
+- **Every registry request URL is assembled from the configured
+  `registryUrl` plus a fixed path and query parameters — never from a field
+  inside a JSON response.** This is the direct fix for the reviewed
+  original's `http.ts` having no URL validation at all: rather than trying
+  to validate a server-supplied download URL after the fact (protocol
+  allowlist, private-IP blocking, redirect origin-pinning — the full
+  `packages/web/web-fetch-http/src/policy.ts` treatment), this design makes
+  a response-controlled fetch destination structurally impossible. The
+  registry can return whatever it wants in a payload; nothing in that
+  payload is ever treated as a place to send a request. `registryUrl` itself
+  is validated `https:`-only once, at plugin load (an operator-config value,
+  not attacker-reachable input), and every request refuses redirects
+  outright (`redirect: 'error'`) rather than following them.
+- **`skillhub_uninstall` only ever deletes files this plugin itself recorded
+  installing.** `state.ts`'s install ledger
+  (`.dsh/skills/.skillhub-state.json`) records exactly which bundle-relative
+  paths were written for each install; uninstall reads that ledger, not the
+  skill name alone, and re-validates every path for containment
+  (`install-path.ts`) immediately before each delete — independent of
+  whatever the ledger says, in case it were ever tampered with out-of-band.
+  Attempting to uninstall a name the ledger has no record of is refused
+  outright, even if a same-named directory happens to exist on disk (tested
+  in `tests/install.test.ts`).
+- **No self-update mechanism at all.** The reviewed original's
+  `self-update.ts` runs an unverified `npx ... plugin add` from unauthenticated
+  GitHub release metadata. This plugin has no equivalent: it's versioned and
+  updated the same way any other `dsh-plugins/` package is (a normal code
+  change, reviewed the same as this one was), so there's no runtime code
+  path that installs new code based on external metadata.
+- **File-count, per-file, and total-bundle byte caps are enforced by the
+  registry client itself**, before a single byte is written to disk
+  (`fetchSkillManifest()` in `registry-client.ts`) — the total-uncompressed-
+  size bound the reviewed original's ZIP path did not visibly have, made
+  simpler here since there's no compression step to bound around in the
+  first place.
+- **A hardcoded file-extension allowlist** (`.md`/`.yaml`/`.yml`/`.json`/
+  `.txt`) rejects anything that isn't plausibly skill content — no script,
+  binary, or executable extension can ever be written by an install,
+  regardless of what a compromised registry response claims a file's path is.
+
+### Trust and limitations (disclosed up front, same posture as flight-search's and vision-bridge's)
+
+- `registryUrl` is a deployment-specific config value with no built-in
+  default pointing at any real service — this plugin defines its own
+  registry contract (documented in its README) rather than reverse-
+  engineering `cocofhu/skillhub`'s actual (undocumented, from this review's
+  vantage point) wire format. A real registry has to implement the two
+  documented endpoints to be usable.
+- `skillhub_install` overwrites a prior install of the same name
+  unconditionally — there is no diff-and-confirm step, matching the
+  reviewed original's behavior in this one respect.
+- The install ledger is this plugin's own bookkeeping, not the filesystem's
+  source of truth: deleting or hand-editing
+  `.dsh/skills/.skillhub-state.json` out-of-band changes what
+  `skillhub_list`/`skillhub_uninstall` believe is installed, though the
+  per-file containment re-check at uninstall time still applies regardless
+  of what the ledger contains.
+- See the plugin's own README (`dsh-plugins/skillhub/README.md`) for the
+  full config surface and the registry contract's exact request/response
+  shapes.
+
+### Implementation
+
+Lives at `dsh-plugins/skillhub/` — same isolated-folder rationale as
+[flight-search](#new-plugin-flight-search) and
+[vision-bridge](#new-plugin-vision-bridge) (`dsh-plugins/README.md`): a
+standalone npm package, own tests (`npm test` — 50 cases covering name/path
+validation, the registry client's https-only/no-redirect/same-origin-by-
+construction/size-and-count-cap behavior, the state ledger's round-trip and
+corrupt-file handling, the full install/uninstall lifecycle against a real
+temporary directory, and tool-registration wiring, all against an injected
+`fetch` with no live network call), no reliance on this repo's pnpm
 workspace, reviewed and maintained on the same bar as the third-party
 plugins reviewed above.
 
