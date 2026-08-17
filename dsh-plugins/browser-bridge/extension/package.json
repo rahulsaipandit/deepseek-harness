@@ -1,0 +1,23 @@
+{
+  "name": "dsh-browser-bridge-extension",
+  "description": "Chrome MV3 extension: text-only read/operate of a user-controlled tab through the dsh-plugin-browser-bridge host plugin",
+  "version": "0.1.0",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "tldts": "^6.1.86"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.0.268",
+    "jsdom": "^26.1.0",
+    "typescript": "^5.6.2",
+    "vite": "^6.0.0",
+    "vitest": "^2.1.0"
+  }
+}

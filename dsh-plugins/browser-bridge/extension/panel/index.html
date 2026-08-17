@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>DSH Browser Bridge</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { font: 13px system-ui, sans-serif; margin: 0; padding: 12px; color: #1a1a1a; }
+    h1 { font-size: 14px; margin: 0 0 8px; }
+    fieldset { border: 1px solid #ddd; border-radius: 6px; margin-bottom: 12px; padding: 8px; }
+    label { display: block; margin: 6px 0 2px; font-size: 12px; color: #555; }
+    input, select { width: 100%; box-sizing: border-box; padding: 4px; font-size: 12px; }
+    button { padding: 4px 8px; font-size: 12px; margin-right: 4px; margin-top: 4px; }
+    #status { font-size: 12px; padding: 6px; background: #f4f4f4; border-radius: 4px; margin-bottom: 8px; }
+    .approval-row { border: 1px solid #e0a800; background: #fff8e1; border-radius: 6px; padding: 8px; margin-bottom: 8px; }
+    .approval-row span { display: block; margin-bottom: 6px; }
+  </style>
+</head>
+<body>
+  <h1>DSH Browser Bridge</h1>
+  <div id="status">Bridge: stopped</div>
+  <div id="approvals"></div>
+  <fieldset>
+    <legend>Settings</legend>
+    <label for="bridgeUrl">Bridge URL (blank = auto-discover)</label>
+    <input id="bridgeUrl" type="text" placeholder="ws://127.0.0.1:3080/ext/bridge" />
+    <label for="token">Bearer token (not needed on loopback)</label>
+    <input id="token" type="password" />
+    <label for="sharePageContent">Page-read approval policy</label>
+    <select id="sharePageContent">
+      <option value="auto">auto (no prompt for reads)</option>
+      <option value="ask">ask (prompt every page read)</option>
+      <option value="off">off (deny all page reads)</option>
+    </select>
+    <button id="save">Save</button>
+  </fieldset>
+  <script type="module" src="../src/panel/main.ts"></script>
+</body>
+</html>

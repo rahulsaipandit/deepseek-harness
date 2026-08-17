@@ -1,0 +1,45 @@
+{
+  "manifest_version": 3,
+  "name": "DSH Browser Bridge",
+  "description": "Text-only browser automation bridge for DeepSeek Harness (dsh-plugin-browser-bridge companion extension)",
+  "version": "0.1.0",
+  "minimum_chrome_version": "116",
+  "permissions": [
+    "sidePanel",
+    "storage",
+    "tabs",
+    "activeTab",
+    "scripting",
+    "alarms",
+    "notifications"
+  ],
+  "host_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "DSH Browser Bridge"
+  },
+  "side_panel": {
+    "default_path": "panel/index.html"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; connect-src ws://127.0.0.1:* http://127.0.0.1:*"
+  }
+}
