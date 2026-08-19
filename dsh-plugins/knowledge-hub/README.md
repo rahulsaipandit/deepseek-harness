@@ -172,8 +172,7 @@ npm install
 npm test
 ```
 
-76 tests across 12 files, all hermetic — no live network calls, no real LLM
-call, no model download. `enableEmbeddings: false` is the default test mode
+87 tests across 13 files. `enableEmbeddings: false` is the default test mode
 for the base plugin (fast, no model download in CI); concept-graph tests use
 a fake `ctx.llm`/`ctx.webServer` throughout, never a real call. The
 embedding cache's own hit/miss and vector-passthrough logic is covered by
@@ -190,6 +189,30 @@ chunking, wikilink extraction/resolution, concept-graph incremental merge
 recomputation, cache round-trip), concept extraction's JSON-response parsing
 and graceful degradation on malformed output, and the concept-graph web
 server's route registration.
+
+**`tests/agent-chat-integration.test.ts`** is the one exception to
+"hermetic": it drives all five tools through a real Cordis `Context` +
+`ToolRuntime` (`ctx.tools.execute()`, the same dispatch path a real agent
+uses — not `ToolDefinition.execute()` called directly, which every other
+test file uses), simulating a multi-turn chat session — facts told across
+early turns recalled/browsed/audited later, a contradiction surfaced back
+to the agent, a "no bleed" negative case and a progressive multi-turn
+context-buildup case (both adapted from `docs/packages/tests/
+testMemoryGoals.md`'s Playwright-driven behavioral test plan for a
+different chat product), and (opt-in) a concept graph connecting notes
+written in different turns. Its semantic-augmentation suite loads the real
+`@xenova/transformers` model over the network and skips itself (not a
+failure) if that's unavailable, matching the plugin's own
+graceful-degradation design. That suite is also where two real ranking
+bugs in `memory-index.ts` were found and fixed — `vectorSearch()` was
+silently running a no-op fulltext search instead of an actual vector
+search (missing Orama's `mode: 'vector'`), and `fuseHybrid()`'s rank-only
+reciprocal-rank fusion discarded real similarity magnitude even once given
+real scores, so hybrid search's runner-up ordering for 3+ notes was
+noise-dominated rather than semantic. Both are fixed; see
+designCognitiveBrainForDSH.md §3.5 for the full writeup. Regression-covered
+by a deterministic test in `memory-index.test.ts` and by this suite's
+real-embeddings `memory_related` test.
 
 ## Appendix: end-to-end verification session
 

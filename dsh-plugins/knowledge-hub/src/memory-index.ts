@@ -172,7 +172,7 @@ export class MemoryIndex {
   }
 }
 
-async function bm25Search(db: AnyOrama, query: string, limit: number): Promise<{ id: string; document: OramaDocument }[]> {
+async function bm25Search(db: AnyOrama, query: string, limit: number): Promise<{ id: string; score: number; document: OramaDocument }[]> {
   const result = (await search(db, {
     term: query,
     limit,
@@ -187,15 +187,29 @@ async function bm25Search(db: AnyOrama, query: string, limit: number): Promise<{
     // is the correct behavior for ranked search: let the score order
     // results, don't let the search step silently drop them.
     threshold: 1,
-  } as never)) as unknown as { hits: { id: string; document: OramaDocument }[] }
+  } as never)) as unknown as { hits: { id: string; score: number; document: OramaDocument }[] }
   return result.hits
 }
 
-async function vectorSearch(db: AnyOrama, queryEmbedding: number[], limit: number): Promise<{ id: string; document: OramaDocument }[]> {
+async function vectorSearch(db: AnyOrama, queryEmbedding: number[], limit: number): Promise<{ id: string; score: number; document: OramaDocument }[]> {
   const result = (await search(db, {
+    // `search()` dispatches on `mode`, defaulting to `'fulltext'` when
+    // unset (confirmed against Orama's own source) — without this, a
+    // `vector` param is silently ignored and this "vector search" was
+    // actually running an empty-term fulltext search the whole time,
+    // returning every doc with an arbitrary, insertion-order ranking and a
+    // score of exactly 0. Found while writing agent-chat-integration.test.ts
+    // (2026-08-19): `memory_related`'s real-embedding results didn't
+    // reflect real cosine similarity at all. `similarity: -1` mirrors the
+    // BM25 side's `threshold: 1` reasoning — Orama's own vector-search
+    // default (0.8) is a relevance FILTER, silently dropping any doc below
+    // it; let every doc through and let fuseHybrid's score ordering decide
+    // relevance instead of the search step dropping them first.
+    mode: 'vector',
     vector: { value: queryEmbedding, property: 'vector' },
+    similarity: -1,
     limit,
-  } as never)) as unknown as { hits: { id: string; document: OramaDocument }[] }
+  } as never)) as unknown as { hits: { id: string; score: number; document: OramaDocument }[] }
   return result.hits
 }
 
@@ -207,20 +221,37 @@ function applyRankedScores(hits: { id: string; document: OramaDocument }[], topK
     .slice(0, topK)
 }
 
+/** Scales to a top-hit-relative [0, 1] range so genuinely large magnitude gaps between runner-up hits survive fusion. */
+function normalizedScore(score: number, maxScore: number): number {
+  return maxScore > 0 ? score / maxScore : 0
+}
+
 function fuseHybrid(
-  vectorHits: { id: string; document: OramaDocument }[],
-  bm25Hits: { id: string; document: OramaDocument }[],
+  vectorHits: { id: string; score: number; document: OramaDocument }[],
+  bm25Hits: { id: string; score: number; document: OramaDocument }[],
   topK: number,
 ): MemoryIndexResult[] {
   const scores = new Map<string, number>()
   const now = Date.now()
 
-  vectorHits.forEach((hit, rank) => {
-    scores.set(hit.id, (scores.get(hit.id) ?? 0) + rrfScore(rank) * WEIGHTS.similarity)
+  // Reciprocal-rank fusion (position-only) was the original design here,
+  // but it's calibrated for combining rankings from large-scale search
+  // engines: with k=60, adjacent ranks 1 vs 2 differ by only ~0.00027,
+  // which is negligible next to genuinely large similarity gaps in a
+  // personal-notes-sized corpus. Found via agent-chat-integration.test.ts
+  // (2026-08-19): a real, on-topic "sibling" note lost a 3-way ranking to
+  // an unrelated "recipe" note because rank-only fusion couldn't tell a
+  // 2x-larger cosine-similarity or BM25-score gap from a rounding error.
+  // Min-max normalizing each list against its own top hit preserves real
+  // relative magnitude instead of discarding it.
+  const maxVectorScore = vectorHits[0]?.score ?? 0
+  vectorHits.forEach((hit) => {
+    scores.set(hit.id, (scores.get(hit.id) ?? 0) + normalizedScore(hit.score, maxVectorScore) * WEIGHTS.similarity)
   })
 
-  bm25Hits.forEach((hit, rank) => {
-    let contribution = rrfScore(rank) * WEIGHTS.similarity
+  const maxBm25Score = bm25Hits[0]?.score ?? 0
+  bm25Hits.forEach((hit) => {
+    let contribution = normalizedScore(hit.score, maxBm25Score) * WEIGHTS.similarity
     const createdMs = hit.document.createdAt ? new Date(hit.document.createdAt).getTime() : now
     const ageHours = (now - createdMs) / 3_600_000
     contribution += Math.max(0, 1 - ageHours / 168) * WEIGHTS.recency

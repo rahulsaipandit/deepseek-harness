@@ -22,6 +22,7 @@ import { MAX_TIMER_DELAY_MS } from '@deepseek-ai/dsh-timeout'
 import { createTransport } from './transport.ts'
 import { syncTools } from './tools.ts'
 import type { ToolBridgeOptions, ToolDisposers } from './tools.ts'
+import { resourceToolDefinitions } from './resources.ts'
 import type { Config } from './index.ts'
 
 /** Automatic reconnect policy for one MCP server connection. */
@@ -141,6 +142,15 @@ export function startConnection(ctx: Context, config: Config, policy: ResolvedRe
   let clientClosed: Promise<void> | undefined
   /** Live tool registrations owned by this server; only {@link enqueueSync} and dispose swap it. */
   let disposers: ToolDisposers = new Map()
+  /**
+   * The two on-demand resource tools (`list_resources`/`read_resource`),
+   * registered once per generation — separately from {@link disposers}
+   * because they're static per connection (no re-sync on
+   * `notifications/tools/list_changed`), so folding them into the same map
+   * `syncTools` manages would make a real-tool re-sync incorrectly dispose
+   * and never re-register them.
+   */
+  let resourceDisposers: (() => void)[] = []
   let reconnectTimer: NodeJS.Timeout | undefined
   /** Consecutive failed connection attempts within the current outage. */
   let failedAttempts = 0
@@ -172,6 +182,8 @@ export function startConnection(ctx: Context, config: Config, policy: ResolvedRe
   /** One disconnect decision per generation: the isCurrent guard makes racing close/error signals idempotent. */
   function generationDown(generation: Client): void {
     if (!isCurrent(generation)) return
+    for (const dispose of resourceDisposers) dispose()
+    resourceDisposers = []
     client = undefined
     clientClosed = undefined
     scheduleReconnect()
@@ -276,6 +288,16 @@ export function startConnection(ctx: Context, config: Config, policy: ResolvedRe
         return
       }
       await enqueueSync(generation, startup ? startupOpts : opts)
+      // Registered once per generation, outside syncTools' own dispose/register
+      // swap (see the resourceDisposers doc comment above). A registration
+      // conflict here is contained the same way a re-sync's tool conflict is
+      // — logged, not fatal, so a namespace collision never falsely triggers
+      // a reconnect cycle for what's really just resource-tool exposure.
+      try {
+        resourceDisposers = resourceToolDefinitions(generation, opts).map(definition => ctx.tools.register(definition))
+      } catch (error) {
+        ctx.logger.error(`${label}: resource tool registration failed, resources unavailable from this server: ${String(error)}`)
+      }
     } catch (error) {
       if (firstAttemptError === undefined) firstAttemptError = error
       // Disposal clears current ownership before it closes the generation, so
@@ -346,6 +368,8 @@ export function startConnection(ctx: Context, config: Config, policy: ResolvedRe
       await syncChain
       for (const dispose of disposers.values()) dispose()
       disposers = new Map()
+      for (const dispose of resourceDisposers) dispose()
+      resourceDisposers = []
     },
   }
 }

@@ -109,4 +109,41 @@ describe('MemoryIndex (with a fake embeddingFn — hybrid path)', () => {
     ])
     expect(calls).toBe(1)
   })
+
+  /**
+   * Regression for two bugs found while writing agent-chat-integration.test.ts
+   * (2026-08-19), fixed together in memory-index.ts:
+   *  1. vectorSearch() never passed Orama's `mode: 'vector'`, so `search()`
+   *     defaulted to `'fulltext'` and silently ran an empty-term fulltext
+   *     search instead — the vector signal was a complete no-op.
+   *  2. fuseHybrid()'s reciprocal-rank fusion discarded real similarity
+   *     magnitude even once given real scores: adjacent ranks differ by
+   *     ~0.00027 (k=60), swamping genuinely large similarity gaps between
+   *     runner-up documents.
+   * Three docs share identical BM25-relevant terms/length (a true BM25 tie)
+   * so only the vector signal can explain the ranking — a controlled,
+   * well-separated embeddingFn (cosine 1.0 / 0.707 / 0) proves both bugs
+   * are fixed: the signal reaches fuseHybrid at all, and its magnitude
+   * — not just its rank — decides runner-up order.
+   */
+  it('ranks by real vector-similarity magnitude, not rank alone, when BM25 scores tie', async () => {
+    const VECTORS: Record<string, number[]> = {
+      'shared note about vector-a today': [1, 0, 0],
+      'shared note about vector-b today': [0.5, 0.5, 0],
+      'shared note about vector-c today': [0, 0, 1],
+      'shared note today please': [1, 0, 0],
+    }
+    const index = new MemoryIndex({
+      dimensions: 3,
+      embeddingFn: async (text: string) => VECTORS[text] ?? [0, 0, 0],
+    })
+    await index.initialize()
+    await index.indexMany([
+      doc('a', 'shared note about vector-a today'),
+      doc('b', 'shared note about vector-b today'),
+      doc('c', 'shared note about vector-c today'),
+    ])
+    const results = await index.search('shared note today please', 10)
+    expect(results.map(r => r.id)).toEqual(['a', 'b', 'c'])
+  })
 })

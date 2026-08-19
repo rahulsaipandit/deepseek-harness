@@ -1,12 +1,13 @@
 # Investigation: bare `dsh-base` bundle "hangs" on boot
 
-Status: **root cause corrected.** An earlier version of this doc blamed
-`@deepseek-ai/dsh-goal` and a missing `sessionProjections` service. That
-diagnosis was wrong — see "Retraction" below. The real explanation is
-architectural, not a bug: a profile whose only bundle is `dsh-base` has no
-run-mode entrypoint plugin at all, so it boots successfully and then
-legitimately sits idle. The fix (add an overlay bundle) is unchanged, but
-why it works is different from what was previously written here.
+Status: **root cause corrected, fully resolved, nothing open.** Two
+earlier diagnoses in this doc were wrong — see both "Retraction" sections
+below — and both have been traced to ground with real instrumentation, not
+just re-argued. The real explanation is architectural, not a bug: a
+profile whose only bundle is `dsh-base` has no run-mode entrypoint plugin
+at all, so it boots successfully and then legitimately sits idle. The fix
+(add an overlay bundle) is unchanged, but why it works is different from
+what was previously written here.
 
 ## Symptom
 
@@ -53,9 +54,10 @@ fix; it's the intended contract: `dsh-base` is a shared core meant to be run
 under an overlay that supplies a concrete mode, and a fresh profile from
 `dsh plugin add` never adds one.
 
-## Retraction: `@deepseek-ai/dsh-goal` was never the cause
+## Retractions: two prior diagnoses in this doc were wrong
 
-An earlier pass at this investigation used a binary search over
+**First retraction: `@deepseek-ai/dsh-goal` was never the cause.** An
+earlier pass at this investigation used a binary search over
 `cordis.patch.yml`'s `disabled: true` entries and concluded the culprit was
 `@deepseek-ai/dsh-goal`'s `ctx.inject(['sessionProjections'], ...)` failing
 to no-op gracefully when `sessionProjections` was supposedly absent from
@@ -86,12 +88,29 @@ to no-op gracefully when `sessionProjections` was supposedly absent from
 
 The two "workarounds" from the earlier version of this doc (disabling
 `goal` alone, or `goal` plus its three dependents) are retracted as
-misleading — they were never fixes, just two different ways of crashing
-before the underlying non-bug ever mattered. The four-way-disable's genuine
-deadlock (confirmed via idle `utime`/`stime` sampling) is a real, separate
-observation about Cordis's scheduler under multiple simultaneous
-`disabled: true` entries, but it's incidental to this investigation, not a
-consequence of anything `goal`-specific.
+misleading — they were never fixes, just two different ways of reaching
+the same non-bug idle state by a different route.
+
+**Second retraction (2026-08-19): the "four-way-disable deadlock" was also
+not a real bug.** The single-`goal`-disable case crashes fast (3 pending
+dependents, `exit 1`) because those three still-enabled dependents fail
+their own dependency check. Explicitly disabling all three *alongside*
+`goal` removes that failure — `assertEntriesActivated` finds zero
+failures, since every affected entry is now deliberately disabled rather
+than unexpectedly pending — so the boot proceeds to a **fully successful**
+completion instead of crashing. A successful boot of bare `dsh-base` is
+exactly the original non-bug this whole document describes: no entrypoint
+plugin, so the process legitimately idles forever afterward. The idle CPU
+observed via `/proc/<pid>/stat` sampling wasn't evidence of a Cordis
+scheduler deadlock — flat, unchanged CPU is indistinguishable from "booted
+fine, now waiting on I/O that will never arrive," which is what actually
+happened. Confirmed directly (2026-08-19) by instrumenting `boot()` and
+`runProfile()` with file-based checkpoints across the exact four-way-disable
+repro: `loader.await()` resolves, `assertEntriesActivated` finds no
+failures and returns, both `watchUserPatches` calls complete — the entire
+traced boot path finishes with no hang anywhere in it. There is no second
+Cordis bug. Both disable variants are simply two different ways of never
+needing the fix this doc actually recommends (§Fix, below).
 
 ## How this was found (corrected)
 
@@ -166,11 +185,9 @@ of a working profile.
 
 ## Next step
 
-No code change is warranted in this repo or upstream for the original
-symptom — it's expected behavior, now correctly documented, not a bug. The
-one still-open, genuinely unexplained observation is the four-way-disable
-deadlock noted above (Cordis's scheduler under multiple simultaneous
-`disabled: true` entries) — low priority, since nobody needs that
-configuration once the real fix (an overlay bundle) is applied, but worth a
-second look if Option-A-style disables are ever revisited for something
-else.
+No code change is warranted in this repo or upstream — it's expected
+behavior, now correctly documented, not a bug. Nothing is left open:
+the four-way-disable observation that looked like a second, distinct
+Cordis deadlock was itself retracted above once traced with real
+instrumentation — it's the same non-bug as the original symptom, reached
+by a different disable configuration, not a separate scheduler defect.

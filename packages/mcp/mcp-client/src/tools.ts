@@ -14,7 +14,7 @@
 
 import { createHash } from 'node:crypto'
 import type { Client } from '@modelcontextprotocol/sdk/client/index.js'
-import { ListToolsResultSchema } from '@modelcontextprotocol/sdk/types.js'
+import { ErrorCode, ListToolsResultSchema, McpError } from '@modelcontextprotocol/sdk/types.js'
 import { z } from 'zod'
 import type { Context } from '@deepseek-ai/cordis'
 import type { ToolDefinition, ToolExecution } from '@deepseek-ai/dsh-tools'
@@ -135,7 +135,19 @@ export async function syncTools(
   const definitions = new Map<string, ToolDefinition>()
   let cursor: string | undefined
   do {
-    const response = await listToolsUncached(client, cursor)
+    let response: Awaited<ReturnType<typeof listToolsUncached>>
+    try {
+      response = await listToolsUncached(client, cursor)
+    } catch (error) {
+      // A server that registers zero tools never wires up a `tools/list`
+      // handler at all — a legitimate shape for a resource-only connector
+      // (e.g. a Jira/knowledge-graph server with no callable functions), not
+      // a broken server. Treat "Method not found" as an empty tool list
+      // instead of failing the whole connection over it; any other error
+      // (network failure, malformed response) still propagates.
+      if (error instanceof McpError && error.code === ErrorCode.MethodNotFound) break
+      throw error
+    }
     for (const tool of response.tools) {
       const publicName = publicToolName(opts.serverName, tool.name)
       if (definitions.has(publicName)) {

@@ -146,6 +146,55 @@ llm-pi-ai:
           input: [text, image]       # vision models: no UI field for this yet, edit settings.yaml by hand
 If you'd rather hand-edit config instead of using the UI, that block above is exactly what to add. The canonical doc for this is docs/user/guide/providers.md ("Add a custom provider" section).
 
+## Appendix
+
+### Session storage and resetting/deleting a session
+
+There is no "delete session" action in the web UI today — only **Archive**,
+which hides a session from list views via a client-side registry flag but
+leaves its event log fully intact on disk (sessions are append-only event
+logs by design, the same architecture used throughout DSH for
+auditability). See `dsh-plugins/README.md`'s live-boot findings for related
+context on how this project's storage layer works.
+
+If you genuinely want a session gone (e.g. after test/throwaway usage),
+you can delete its files directly, since the JSONL persistence backend
+stores one directory per session:
+
+```
+$DSH_HOME/sessions/<sanitized-cwd>/session-<uuid>/session.jsonl[.zstd]
+```
+
+`$DSH_HOME` defaults to `~/.dsh`. The `<sanitized-cwd>` segment encodes the
+working directory the profile was booted from (e.g.
+`--D-Github-deepseek-harness--`). This location is **shared across every
+profile** on the machine (`web`, `headless`, and any custom profile all
+point at the same `dshHomePath('sessions')` root per
+`packages/bundle/base/cordis.patch.yml`), so deleting here affects that
+session regardless of which profile created it.
+
+To reset:
+
+1. Stop the running `dsh` process first — it holds file locks and
+   in-memory state for active sessions; deleting live files underneath it
+   can cause errors or a stale UI until restarted.
+2. Delete the specific session's folder (surgical — only removes that one
+   session), or the entire `sessions/` folder (full reset — removes every
+   session across every profile).
+3. Restart `dsh`. The session list reflects whatever remains on disk; no
+   separate index needs clearing (session search/query state self-heals
+   against the persistence backend's file listing on the next
+   reconciliation pass).
+
+There is currently no supported way to delete a session from within the UI
+itself, and no CLI command for it either — this is a genuine gap, not a
+hidden feature. Adding a real delete action would need a new storage-layer
+primitive (none of the current backends expose delete/purge), a new
+RPC/API endpoint (archive doesn't need one since it's purely a client-side
+flag), and a safety guard against deleting a session that is currently
+running or is the parent of live forked sub-sessions — none of which exist
+today.
+
 ## Community and support
 
 - Feel free to submit feedback or bug reports through [GitHub Discussions](https://github.com/deepseek-ai/deepseek-harness/discussions).

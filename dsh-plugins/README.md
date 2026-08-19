@@ -51,6 +51,17 @@ without depending on this monorepo's internal build.
   community plugins reviewed in `docs/adr/rp_dshPlugins.md` (visionDS,
   dsh-plugin-mm-vision) — see its README and that doc's design section for
   what was kept from each and what was fixed.
+- **[mcp-server](./mcp-server/)** — exposes a configurable allowlist of
+  `ctx.tools` (default: `dsh-plugin-knowledge-hub`'s five memory tools) as
+  an authenticated MCP Streamable HTTP server, so an external app (e.g.
+  Pluely) can call into this DSH instance. Transport/security posture
+  (bearer token, IP- and token-based rate limiting, loopback trust
+  boundary) mirrors what GBrain documents for its own MCP HTTP surface;
+  the tool surface is deliberately capped at existing tools only — no
+  synthesis, graph traversal, or knowledge-gap analysis. See its README
+  and `docs/designCognitiveBrainForDSH.md`'s MCP server section for the
+  scope decision and why the opposite direction (DSH consuming an
+  external MCP server) needed no new plugin at all.
 
 ## Live-boot verification findings (2026-08-18)
 

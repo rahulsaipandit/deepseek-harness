@@ -69,6 +69,11 @@ Every MCP tool has two names: the raw MCP name (sent on the wire in `tools/call`
 - On disconnect/crash: the supervisor restarts the original server config with exponential backoff (`reconnect.initialDelayMs` doubling up to `reconnect.maxDelayMs`) and re-runs discovery on success — the recovered generation replaces the previous one, so tools neither duplicate nor leak. During the outage the last good generation stays registered; calls against it fail until recovery.
 - Reconnection is budgeted per outage: after `reconnect.maxAttempts` consecutive failures the server's tools are unregistered and reconnection stops until an HMR reload or Host restart. A connection that survives past `maxDelayMs` resets the budget, so an occasionally-crashing server recovers indefinitely while a crash-looping one — even with briefly successful connects — still exhausts the cap instead of restarting forever.
 - Reconnect states are user-visible in logs: reconnecting (warn, with attempt count and delay), recovered (info), final failure and disabled-loss (error). Disposal cancels any pending reconnect. With `reconnect.enabled: false`, a lost connection keeps tools registered but failing until a reload — the manual-recovery behavior.
+- A server that advertises zero tools (e.g. a resource-only connector) never wires up a `tools/list` handler at all; that specific `McpError`/`MethodNotFound` response is treated as an empty tool list rather than a connection failure. Any other error from `tools/list` still fails the attempt normally.
+
+## Resources (on-demand)
+
+A server that advertises the `resources` capability gets two extra synthetic tools registered per connection generation: `mcp__<serverName>__list_resources` (no arguments, lists all resources with name/description/mimeType) and `mcp__<serverName>__read_resource` (`{ uri }`, returns the resource's text content). Both call the live client at request time — there's no re-sync/generation-diffing machinery like `syncTools`, since resource *tools* are static per connection and always reflect whatever resources currently exist upstream. A server with no `resources` capability gets neither tool. See `src/resources.ts`.
 
 ## Services consumed
 
@@ -108,7 +113,7 @@ Append-only; newly visible content follows the reusable request prefix and does 
 
 ## Known Limitations and Deferred Work
 
-- **Tools are the only bridged MCP capability** — Resources and Prompts have no harness consumer and are deferred.
+- **Prompts have no harness consumer and are deferred.** Resources are now bridged (see above) via two on-demand tools per capable server.
 - **Startup timeout is inherited from the MCP SDK** — DSH does not yet expose a connection/discovery timeout. Each initialize or paginated `tools/list` request uses the SDK's 60-second default, so an unresponsive server or cursor chain can delay both activation and teardown while the initial synchronization settles.
 - **Reconnect triggers on transport close** — a crashed stdio child fires it; Streamable HTTP failures surface per request and through the SDK transport's own SSE-stream recovery, so an unreachable HTTP server is retried per call rather than respawned by the supervisor.
 - **Native non-text rendering is lossy** — image, audio, and resource payloads become placeholders in model context even though the execution-local canonical value preserves their JSON blocks. Richer Native multimedia projection is deferred.
