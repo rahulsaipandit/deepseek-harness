@@ -146,6 +146,51 @@ describe('apply', () => {
     expect(related.results.every((r: { id: string }) => r.id !== a.id)).toBe(true)
   })
 
+  it('memory_remember writes an optional resource field into frontmatter', async () => {
+    const { ctx, tools } = makeCtx()
+    apply(ctx, Config({ vaultPath, enableEmbeddings: false }))
+
+    const remembered = await tools.get('memory_remember')!.execute(
+      { title: 'From a URL', content: 'Some captured content.', resource: 'https://example.com/article' },
+      exec(),
+    )
+    const raw = await readFile(join(vaultPath, `${remembered.id}.md`), 'utf8')
+    expect(raw).toContain('resource: https://example.com/article')
+  })
+
+  it('memory_remember flags a possible contradiction with a tag-overlapping, content-negating existing note', async () => {
+    const { ctx, tools } = makeCtx()
+    apply(ctx, Config({ vaultPath, enableEmbeddings: false }))
+
+    await tools.get('memory_remember')!.execute(
+      { title: 'Theme preference', content: 'Dark mode is enabled for all editors.', tags: ['preferences', 'theme'] },
+      exec(),
+    )
+    const second = await tools.get('memory_remember')!.execute(
+      { title: 'Theme preference updated', content: 'Dark mode is disabled now.', tags: ['preferences', 'theme'] },
+      exec(),
+    )
+
+    expect(second.possibleContradiction).toBeDefined()
+    expect(second.possibleContradiction.title).toBe('Theme preference')
+  })
+
+  it('memory_remember does not flag a contradiction when there is no shared tag', async () => {
+    const { ctx, tools } = makeCtx()
+    apply(ctx, Config({ vaultPath, enableEmbeddings: false }))
+
+    await tools.get('memory_remember')!.execute(
+      { title: 'Theme preference', content: 'Dark mode is enabled.', tags: ['preferences'] },
+      exec(),
+    )
+    const second = await tools.get('memory_remember')!.execute(
+      { title: 'Unrelated', content: 'Dark mode is disabled.', tags: ['unrelated-topic'] },
+      exec(),
+    )
+
+    expect(second.possibleContradiction).toBeUndefined()
+  })
+
   it('startup rescan finds hand-written markdown files that were never created via memory_remember', async () => {
     await writeFile(
       join(vaultPath, 'hand.md'),

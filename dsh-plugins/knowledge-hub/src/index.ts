@@ -17,10 +17,13 @@ import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { createAuditLog } from './audit-log.ts'
 import { chunkByHeading } from './chunking.ts'
+import { findContradiction } from './contradiction.ts'
 import { createLlmConceptExtractor } from './concept-extractor.ts'
 import { mergeNoteIntoGraph, readConceptGraphCache, writeConceptGraphCache } from './concept-graph.ts'
 import type { ConceptExtractor } from './concept-extractor.ts'
-import { createLocalEmbeddingFunction } from './embedding.ts'
+import { createLocalEmbeddingFunction, type EmbeddingFunction } from './embedding.ts'
+import { hashContent, pruneEmbeddingCache, readEmbeddingCache, writeEmbeddingCache } from './embedding-cache.ts'
+import type { EmbeddingCache } from './embedding-cache.ts'
 import { nextId } from './id.ts'
 import { MemoryIndex } from './memory-index.ts'
 import type { MemoryFile, MemoryFrontmatter } from './types.ts'
@@ -60,6 +63,7 @@ interface RememberArgs {
   type?: string
   tags?: string[]
   confidence?: number
+  resource?: string
 }
 
 interface RecallArgs {
@@ -130,11 +134,40 @@ export function apply(ctx: Context, config: Config): void {
   }
 
   let initPromise: Promise<MemoryIndex> | undefined
+  let embeddingFn: EmbeddingFunction | null = null
+  let embeddingCache: EmbeddingCache | undefined
+
+  /**
+   * Content-hash-keyed embedding lookup (designCognitiveBrainForDSH.md
+   * §5.1/§5.4): reuses a note's cached embedding when its content hash is
+   * unchanged since the last time it was embedded, and transparently
+   * recomputes when it isn't — the same check covers both "skip redundant
+   * work on an unchanged vault" and "a hand-edited note went stale."
+   * Mutates the in-memory cache; callers persist it via `persistEmbeddingCache()`.
+   */
+  async function resolveEmbedding(id: string, content: string, title: string): Promise<number[] | undefined> {
+    if (!embeddingFn || !embeddingCache) return undefined
+    const contentHash = hashContent(content || title)
+    const cached = embeddingCache.entries[id]
+    if (cached && cached.contentHash === contentHash) return cached.embedding
+    const embedding = await embeddingFn(content || title)
+    embeddingCache.entries[id] = { contentHash, embedding }
+    return embedding
+  }
+
+  async function persistEmbeddingCache(): Promise<void> {
+    if (!embeddingCache) return
+    try {
+      await writeEmbeddingCache(vaultPath, embeddingCache)
+    } catch (error) {
+      ctx.logger?.warn?.(`knowledge-hub: failed to persist the embedding cache; the next boot will re-embed unnecessarily: ${String(error)}`)
+    }
+  }
 
   async function ensureInitialized(): Promise<MemoryIndex> {
     if (!initPromise) {
       initPromise = (async () => {
-        const embeddingFn = config.enableEmbeddings
+        embeddingFn = config.enableEmbeddings
           ? await createLocalEmbeddingFunction(
             { model: config.embeddingModel },
             error => ctx.logger?.warn?.(`knowledge-hub: embedding model failed to load, falling back to keyword-only search: ${String(error)}`),
@@ -146,7 +179,21 @@ export function apply(ctx: Context, config: Config): void {
         })
         await index.initialize()
         const files = await vaultStore.list()
-        await index.indexMany(files.map(toIndexDoc))
+
+        if (embeddingFn) {
+          embeddingCache = pruneEmbeddingCache(
+            await readEmbeddingCache(vaultPath),
+            new Set(files.map(f => f.frontmatter.id)),
+          )
+          const docs = await Promise.all(files.map(async (file) => {
+            const vector = await resolveEmbedding(file.frontmatter.id, file.content, file.frontmatter.title)
+            return { ...toIndexDoc(file), ...(vector ? { vector } : {}) }
+          }))
+          await index.indexMany(docs)
+          await persistEmbeddingCache()
+        } else {
+          await index.indexMany(files.map(toIndexDoc))
+        }
         return index
       })()
     }
@@ -183,6 +230,34 @@ export function apply(ctx: Context, config: Config): void {
     await writeConceptGraphCache(vaultPath, graph)
   }
 
+  /**
+   * Cheap, LLM-free contradiction check (designCognitiveBrainForDSH.md
+   * §5.6): searches the *existing* vault (the new note isn't indexed yet)
+   * for a candidate sharing a tag with the new note, then runs the eight
+   * negation-pattern pairs against both notes' content. Returns advisory
+   * info only — never writes `contradictedBy` itself; that requires a
+   * person or agent to confirm it (no `memory_edit` tool exists to act on
+   * it automatically, by design, §5.4).
+   */
+  async function findPossibleContradiction(
+    index: MemoryIndex,
+    newTags: readonly string[],
+    newContent: string,
+  ): Promise<{ id: string; title: string; path: string; reason: string } | undefined> {
+    if (newTags.length === 0) return undefined
+    const hits = await index.search(newContent, 5)
+    for (const hit of hits) {
+      const candidate = await vaultStore.read(hit.id)
+      if (!candidate) continue
+      if (!candidate.frontmatter.tags.some(tag => newTags.includes(tag))) continue
+      const reason = findContradiction(newContent, candidate.content)
+      if (reason) {
+        return { id: candidate.frontmatter.id, title: candidate.frontmatter.title, path: candidate.path, reason }
+      }
+    }
+    return undefined
+  }
+
   function toIndexDoc(file: MemoryFile) {
     return {
       id: file.frontmatter.id,
@@ -205,6 +280,7 @@ export function apply(ctx: Context, config: Config): void {
       type: { type: 'string', description: '"note" (default), "fact", "procedure", or "entity".' },
       tags: { type: 'array', items: { type: 'string' }, description: 'Optional tags for filtering/search.' },
       confidence: { type: 'number', description: 'Optional 0-1 confidence. Defaults to 0.5.' },
+      resource: { type: 'string', description: 'Optional canonical source URL this memory came from (OKF-compatible). Omit for a note with no external origin.' },
     },
     output: {
       schema: {
@@ -214,11 +290,24 @@ export function apply(ctx: Context, config: Config): void {
           id: { type: 'string', required: true },
           path: { type: 'string', required: true },
           conceptGraphUrl: { type: 'string' },
+          possibleContradiction: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              id: { type: 'string', required: true },
+              title: { type: 'string', required: true },
+              path: { type: 'string', required: true },
+              reason: { type: 'string', required: true },
+            },
+          },
         },
       },
       render: (_args, value) => [{
         type: 'text',
-        text: `Remembered (${value.id}) at ${value.path}.${value.conceptGraphUrl ? ` Concept graph: ${value.conceptGraphUrl}` : ''}`,
+        text: `Remembered (${value.id}) at ${value.path}.${value.conceptGraphUrl ? ` Concept graph: ${value.conceptGraphUrl}` : ''}`
+          + (value.possibleContradiction
+            ? ` Possible contradiction with "${value.possibleContradiction.title}" [${value.possibleContradiction.path}]: ${value.possibleContradiction.reason}.`
+            : ''),
       }],
     },
     isConcurrencySafe: () => false,
@@ -231,20 +320,33 @@ export function apply(ctx: Context, config: Config): void {
       }
 
       const id = nextId()
+      const tags = args.tags ?? []
       const frontmatter: MemoryFrontmatter = {
         id,
         title: args.title,
         type,
-        tags: args.tags ?? [],
+        tags,
         createdAt: new Date().toISOString(),
         confidence: args.confidence ?? 0.5,
         sourceCount: 1,
+        ...(args.resource === undefined ? {} : { resource: args.resource }),
       }
       const file: MemoryFile = { frontmatter, content: args.content, path: '' }
 
+      // Checked against the *existing* index, before this note is added to it,
+      // so it never matches itself.
+      let possibleContradiction: { id: string; title: string; path: string; reason: string } | undefined
+      try {
+        possibleContradiction = await findPossibleContradiction(index, tags, args.content)
+      } catch (error) {
+        ctx.logger?.warn?.(`knowledge-hub: contradiction check failed; proceeding without it: ${String(error)}`)
+      }
+
       await vaultStore.write(file)
       try {
-        await index.index(toIndexDoc(file))
+        const vector = await resolveEmbedding(id, file.content, file.frontmatter.title)
+        await index.index({ ...toIndexDoc(file), ...(vector ? { vector } : {}) })
+        await persistEmbeddingCache()
       } catch (error) {
         ctx.logger?.warn?.(`knowledge-hub: indexing failed after a successful write; search may be stale until restart: ${String(error)}`)
       }
@@ -258,7 +360,12 @@ export function apply(ctx: Context, config: Config): void {
         }
       }
 
-      return { id, path: resolve(vaultPath, `${id}.md`), ...(graphUrl ? { conceptGraphUrl: graphUrl } : {}) }
+      return {
+        id,
+        path: resolve(vaultPath, `${id}.md`),
+        ...(graphUrl ? { conceptGraphUrl: graphUrl } : {}),
+        ...(possibleContradiction ? { possibleContradiction } : {}),
+      }
     },
     presentCall(args: RememberArgs) {
       return { card: 'generic', title: `Remember "${args.title}"`, kind: 'edit' }

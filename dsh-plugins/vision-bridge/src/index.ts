@@ -41,6 +41,9 @@ import { buildPrompt, resolveMode, type PromptMode } from './prompt.ts'
 import { DEFAULT_PROVIDERS, orderedProviders, type ProviderConfig } from './providers.ts'
 import { callVisionProvider, VisionApiFetchError, VisionApiParseError } from './vision-api.ts'
 
+/** Services required before this plugin can register its tool and resolve images/credentials. */
+export const inject = ['tools', 'fs', 'credentials']
+
 const providerConfigSchema = z.object({
   id: z.string(),
   label: z.string().default(''),

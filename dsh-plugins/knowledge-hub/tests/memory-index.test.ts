@@ -64,4 +64,49 @@ describe('MemoryIndex (with a fake embeddingFn — hybrid path)', () => {
     const results = await index.search('hello', 10)
     expect(results.length).toBeGreaterThan(0)
   })
+
+  it('index() uses a precomputed doc.vector instead of calling embeddingFn', async () => {
+    let calls = 0
+    const index = new MemoryIndex({
+      dimensions: 3,
+      embeddingFn: async () => {
+        calls++
+        return [1, 1, 1]
+      },
+    })
+    await index.initialize()
+    await index.index(doc('a', 'hello world', { vector: [0, 0, 0] }))
+    expect(calls).toBe(0)
+  })
+
+  it('index() still calls embeddingFn when doc.vector is absent', async () => {
+    let calls = 0
+    const index = new MemoryIndex({
+      dimensions: 3,
+      embeddingFn: async () => {
+        calls++
+        return [1, 1, 1]
+      },
+    })
+    await index.initialize()
+    await index.index(doc('a', 'hello world'))
+    expect(calls).toBe(1)
+  })
+
+  it('indexMany() calls embeddingFn only for docs missing a precomputed vector', async () => {
+    let calls = 0
+    const index = new MemoryIndex({
+      dimensions: 3,
+      embeddingFn: async () => {
+        calls++
+        return [1, 1, 1]
+      },
+    })
+    await index.initialize()
+    await index.indexMany([
+      doc('a', 'hello world', { vector: [0, 0, 0] }),
+      doc('b', 'goodbye world'),
+    ])
+    expect(calls).toBe(1)
+  })
 })

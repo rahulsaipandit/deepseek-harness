@@ -119,7 +119,7 @@ export function registerBrowserTools(
     output: TEXT_OUTPUT,
     timeoutMs: options.toolTimeoutMs,
     isConcurrencySafe: () => true,
-    async execute(args: { delta?: boolean; region?: string }, exec) {
+    async execute(args: { delta?: boolean; region?: string }, exec: ToolExecution) {
       return call(exec, 'browser_snapshot', {
         ...args.delta !== undefined ? { delta: args.delta } : {},
         ...args.region !== undefined ? { region: args.region } : {},
@@ -140,7 +140,7 @@ export function registerBrowserTools(
     output: TEXT_OUTPUT,
     timeoutMs: options.toolTimeoutMs,
     isConcurrencySafe: () => false,
-    async execute(args: { index: number; frame?: number }, exec) {
+    async execute(args: { index: number; frame?: number }, exec: ToolExecution) {
       return call(exec, 'browser_click', args as Record<string, unknown>)
     },
     presentCall(args) {
@@ -161,7 +161,7 @@ export function registerBrowserTools(
     output: TEXT_OUTPUT,
     timeoutMs: options.toolTimeoutMs,
     isConcurrencySafe: () => false,
-    async execute(args: { index: number; frame?: number; text: string; replace?: boolean }, exec) {
+    async execute(args: { index: number; frame?: number; text: string; replace?: boolean }, exec: ToolExecution) {
       return call(exec, 'browser_type', {
         index: args.index,
         ...args.frame !== undefined ? { frame: args.frame } : {},
@@ -184,7 +184,7 @@ export function registerBrowserTools(
     output: TEXT_OUTPUT,
     timeoutMs: options.toolTimeoutMs,
     isConcurrencySafe: () => false,
-    async execute(args: { key: string; frame?: number }, exec) {
+    async execute(args: { key: string; frame?: number }, exec: ToolExecution) {
       return call(exec, 'browser_press', args as Record<string, unknown>)
     },
     presentCall(args) {
@@ -203,7 +203,7 @@ export function registerBrowserTools(
     output: TEXT_OUTPUT,
     timeoutMs: options.toolTimeoutMs,
     isConcurrencySafe: () => false,
-    async execute(args: { direction: 'up' | 'down' | 'top' | 'bottom'; amount?: number; frame?: number }, exec) {
+    async execute(args: { direction: 'up' | 'down' | 'top' | 'bottom'; amount?: number; frame?: number }, exec: ToolExecution) {
       return call(exec, 'browser_scroll', {
         direction: args.direction,
         ...args.amount !== undefined ? { amount: args.amount } : {},
@@ -224,7 +224,7 @@ export function registerBrowserTools(
     output: TEXT_OUTPUT,
     timeoutMs: options.toolTimeoutMs,
     isConcurrencySafe: () => false,
-    async execute(args: { url: string }, exec) {
+    async execute(args: { url: string }, exec: ToolExecution) {
       return call(exec, 'browser_navigate', args as Record<string, unknown>)
     },
     presentCall(args) {
@@ -245,7 +245,7 @@ export function registerBrowserTools(
       output: TEXT_OUTPUT,
       timeoutMs: options.toolTimeoutMs,
       isConcurrencySafe: () => false,
-      async execute(_args, exec) {
+      async execute(_args: Record<string, never>, exec: ToolExecution) {
         return call(exec, name, {})
       },
       presentCall() {
@@ -264,7 +264,7 @@ export function registerBrowserTools(
     output: TEXT_OUTPUT,
     timeoutMs: options.toolTimeoutMs,
     isConcurrencySafe: () => true,
-    async execute(args: { selector?: string; frame?: number }, exec) {
+    async execute(args: { selector?: string; frame?: number }, exec: ToolExecution) {
       return call(exec, 'browser_get_text', {
         ...args.selector !== undefined ? { selector: args.selector } : {},
         ...args.frame !== undefined ? { frame: args.frame } : {},
@@ -285,7 +285,7 @@ export function registerBrowserTools(
     output: TEXT_OUTPUT,
     timeoutMs: options.toolTimeoutMs,
     isConcurrencySafe: () => true,
-    async execute(args: { ms?: number; frame?: number }, exec) {
+    async execute(args: { ms?: number; frame?: number }, exec: ToolExecution) {
       return call(exec, 'browser_wait', {
         ...args.ms !== undefined ? { ms: args.ms } : {},
         ...args.frame !== undefined ? { frame: args.frame } : {},

@@ -24,6 +24,55 @@ describe('parseMemoryFile / serializeMemoryFile', () => {
     expect(parsed?.content).toBe(file.content)
   })
 
+  it('round-trips the optional resource and contradictedBy fields', () => {
+    const file: MemoryFile = {
+      frontmatter: {
+        id: 'mem_okf',
+        title: 'OKF-linked note',
+        type: 'note',
+        tags: [],
+        createdAt: '2026-08-18T10:00:00.000Z',
+        confidence: 0.5,
+        sourceCount: 1,
+        resource: 'https://example.com/source',
+        contradictedBy: ['mem_other'],
+      },
+      content: 'Body.',
+      path: '/tmp/mem_okf.md',
+    }
+    const raw = serializeMemoryFile(file)
+    const parsed = parseMemoryFile(raw, file.path)
+    expect(parsed?.frontmatter.resource).toBe('https://example.com/source')
+    expect(parsed?.frontmatter.contradictedBy).toEqual(['mem_other'])
+  })
+
+  it('round-trips a null resource', () => {
+    const file: MemoryFile = {
+      frontmatter: {
+        id: 'mem_null_resource',
+        title: 'No external origin',
+        type: 'note',
+        tags: [],
+        createdAt: '2026-08-18T10:00:00.000Z',
+        confidence: 0.5,
+        sourceCount: 1,
+        resource: null,
+      },
+      content: 'Body.',
+      path: '/tmp/mem_null_resource.md',
+    }
+    const raw = serializeMemoryFile(file)
+    const parsed = parseMemoryFile(raw, file.path)
+    expect(parsed?.frontmatter.resource).toBeNull()
+  })
+
+  it('leaves resource and contradictedBy undefined when absent', () => {
+    const raw = `---\nid: mem_4\ntitle: Minimal\ntype: note\ncreatedAt: "2026-08-18T10:00:00.000Z"\n---\nBody.\n`
+    const parsed = parseMemoryFile(raw, '/tmp/mem_4.md')
+    expect(parsed?.frontmatter.resource).toBeUndefined()
+    expect(parsed?.frontmatter.contradictedBy).toBeUndefined()
+  })
+
   it('defaults confidence and sourceCount, and tags to []', () => {
     const raw = `---\nid: mem_2\ntitle: Minimal\ntype: note\ncreatedAt: "2026-08-18T10:00:00.000Z"\n---\nBody.\n`
     const parsed = parseMemoryFile(raw, '/tmp/mem_2.md')

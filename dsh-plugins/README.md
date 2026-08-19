@@ -52,6 +52,52 @@ without depending on this monorepo's internal build.
   dsh-plugin-mm-vision) — see its README and that doc's design section for
   what was kept from each and what was fixed.
 
+## Live-boot verification findings (2026-08-18)
+
+Every plugin here had unit-test coverage against a fake Cordis context, but
+none had been verified against a real, fully-booted DSH host until this
+pass — wiring all nine into a live `web` profile's `cordis.patch.yml`
+surfaced defects that unit tests, by construction, cannot: a fake test `ctx`
+already carries whatever services a test author stubs in, regardless of
+what the plugin actually declares in `inject`.
+
+- **browser-bridge**: had never had `npm install` run against it (its own
+  `node_modules` was empty), and `src/tools.ts` had several `execute`
+  callbacks missing a type annotation on their second (`exec`) parameter,
+  which only surfaces as a build error once real dependencies are
+  installed. Fixed: ran `npm install`, added the missing `ToolExecution`
+  annotations.
+- **flight-search**: accessed `ctx.tools` directly without declaring
+  `export const inject = ['tools']`. Cordis only resolves a service on
+  `ctx.<name>` for services a plugin's own `inject` list names; without it,
+  a real boot throws `cannot get property "tools" without inject`. Fixed.
+- **vision-bridge**: same class of bug — used `ctx.tools`, `ctx.fs`, and
+  `ctx.credentials` directly with no `inject` declaration at all. Fixed by
+  adding `export const inject = ['tools', 'fs', 'credentials']`.
+- **imchat**: same class of bug — used `ctx.agents`, `ctx.credentials`, and
+  `ctx.userQuestions` with no `inject` declaration. Fixed by adding
+  `export const inject = ['agents', 'credentials', 'userQuestions']`. This
+  also surfaced a separate, real architectural constraint, not a bug: the
+  plugin unconditionally registers itself as *the* `ctx.userQuestions`
+  provider in `apply()` (regardless of whether any chat platform identity
+  is even configured), which fatally collides
+  (`UserQuestionError: a user-questions provider is already registered`)
+  with `@deepseek-ai/dsh-host-apiproxy`'s own provider that the `web` UI
+  depends on. **imchat cannot run alongside `dsh-web-app`** — it's designed
+  for a profile with no other UI answering questions (e.g. a headless-only
+  deployment). This isn't something to fix in the plugin; it's a deployment
+  constraint worth knowing before wiring it into any profile.
+- **web-terminal**: its declared `inject` was already correct
+  (`['webServer', 'agents', 'terminals']`), but no built-in bundle
+  (`dsh-base`, `dsh-web-app`, `dsh-headless`) actually mounts
+  `@deepseek-ai/dsh-terminal` (the `ctx.terminals` provider) — it's an
+  opt-in package a profile must add explicitly alongside this plugin.
+
+None of the other five plugins (knowledge-hub, persona-scheduler, skillhub,
+team-channel, and browser-bridge past its build fix) needed any inject
+corrections — their `export const inject` lists already matched every
+direct `ctx.<service>` access.
+
 ## Conventions these plugins follow
 
 - No hardcoded secrets; credentials (when a plugin needs any) resolve

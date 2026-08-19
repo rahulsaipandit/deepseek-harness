@@ -87,6 +87,65 @@ pnpm dsh plugin --profile <name> add ../dsh-plugins/skillhub
 
 `dsh plugin add` installs the package into the profile and reconciles its declared bundle manifest into the profile's composed Cordis configuration; a plugin's own required settings (e.g. a filesystem path it needs) are then set via that profile's `cordis.patch.yml` overlay. See [Web UI guide](docs/user/guide/index.md) and [architecture documentation](docs/architecture.md) for the full configuration-layering model.
 
+Findings
+(a) Does local model support exist?
+Yes, but generically — there's no provider named "Ollama"/"LM Studio"/"llama.cpp" specifically. Instead there's a generic custom provider mechanism (openai-compatible protocol) that any self-hosted OpenAI-compatible server (Ollama's /v1, LM Studio, vLLM, llama.cpp server, text-generation-webui, etc.) can use as-is, since these all expose an OpenAI-compatible /v1/chat/completions API.
+
+(b) UI steps (docs/user/guide/providers.md:21-30, apps/web Models settings page = packages/client/ui-settings-models):
+
+Settings → Models → Add a custom provider.
+Fill in: Provider ID (lowercase, permanent — used in requests/sessions/credential refs), Display name, Base URL (e.g. http://localhost:11434/v1 for Ollama, or your LM Studio/llama.cpp server URL), API protocol, API key (optional — local servers often don't need one, but the credential field can be left blank or set to a placeholder if the server ignores it), and at least one model id.
+Under Model catalog, click Fetch available models to query GET /models on that base URL with the given credential — this works for Ollama/LM Studio/vLLM since they implement that OpenAI-compatible endpoint. Otherwise enter model ids manually.
+Save. The Models page writes credentials write-only through the credentials service into $DSH_HOME/.credentials.yaml; settings.yaml only keeps a credential reference (e.g. apiKeyEnv).
+Optionally, for vision-capable local models, add input: [text, image] per-model since the UI form has no field for it (must hand-edit $DSH_HOME/settings.yaml).
+(c) Package/plugin and config shape: Plugin is dsh-llm-pi-ai (packages/llm/llm-pi-ai). Config lives under llm-pi-ai.providers.<id> in settings.yaml:
+
+
+llm-pi-ai:
+  providers:
+    my-lmstudio:
+      apiKeyEnv: LMSTUDIO_API_KEY   # optional; credential ref, not the literal secret
+      api: openai-completions     # protocol enum: openai-completions | openai-responses | anthropic-messages
+      baseURL: http://192.168.1.51:1234/v1
+      models:
+        - id: llama3.1
+        - id: llava
+          input: [text, image]
+Supported protocol identifiers are defined in packages/llm/llm-pi-ai/src/provider.ts:47-51 (PROTOCOLS table: openai-completions, openai-responses, anthropic-messages) — openai-completions (the default/first) is what Ollama-style local servers use. Native-auth protocols (Bedrock/Vertex/Azure/Codex) are deliberately excluded from the hand-declared route surface (comment at provider.ts:35-45).
+
+(d) Config-file (cordis.patch.yml) example: packages/bundle/base/cordis.patch.yml:412 shows the DeepSeek built-in provider pattern (apiKeyEnv: DEEPSEEK_API_KEY under the llm-deepseek plugin id entry) — same shape as a hand-declared provider, just with a fixed provider id. The docs/user/guide/providers.md:37-65 doc has the canonical example for a custom/local settings.yaml provider (shown above, called my-gateway there).
+
+Docs: docs/user/guide/providers.md ("Add a custom provider" section, lines 21-30) is the authoritative doc; no README mentions Ollama/LM Studio by name anywhere in packages/* or root docs — the "Ollama"/"llama.cpp" hits found were unrelated research notes in docs/adr/rp_dshPlugins.md, docs/agenticHarness.md, docs/CompareTools.md.
+
+Configuring a local LLM in Settings → Models
+DSH doesn't have a named "Ollama"/"LM Studio" option — instead it has a generic custom provider mechanism that works with any self-hosted OpenAI-compatible server (Ollama, LM Studio, vLLM, llama.cpp server, text-generation-webui, etc.), since they all expose an OpenAI-compatible /v1/chat/completions API.
+
+Steps in the web UI
+Settings → Models → Add a custom provider
+Fill in:
+Provider ID — lowercase, permanent (used in requests/sessions/credential refs), e.g. my-ollama
+Display name — whatever you want shown in the picker
+Base URL — e.g. http://localhost:11434/v1 for Ollama, or http://192.168.1.51:1234/v1 your LM Studio/vLLM/llama.cpp server's URL
+API protocol — openai-completions (the one local servers use)
+API key — optional; local servers usually don't need one, leave blank or put a placeholder if the server ignores it
+Model catalog — click Fetch available models to auto-query the server's /models endpoint (works with Ollama/LM Studio/vLLM), or type model ids manually (e.g. llama3.1)
+Save. Any API key you entered is written write-only into $DSH_HOME/.credentials.yaml via the credentials service — settings.yaml only keeps a reference to it, never the literal secret.
+What this produces under the hood
+The plugin backing this is dsh-llm-pi-ai (packages/llm/llm-pi-ai), and it writes into settings.yaml:
+
+
+llm-pi-ai:
+  providers:
+    my-lmstudio:
+      apiKeyEnv: LMSTUDIO_API_KEY      # optional credential reference, not the literal key
+      api: openai-completions        # openai-completions | openai-responses | anthropic-messages
+      baseURL: http://192.168.1.51:1234/v1
+      models:
+        - id: llama3.1
+        - id: llava
+          input: [text, image]       # vision models: no UI field for this yet, edit settings.yaml by hand
+If you'd rather hand-edit config instead of using the UI, that block above is exactly what to add. The canonical doc for this is docs/user/guide/providers.md ("Add a custom provider" section).
+
 ## Community and support
 
 - Feel free to submit feedback or bug reports through [GitHub Discussions](https://github.com/deepseek-ai/deepseek-harness/discussions).

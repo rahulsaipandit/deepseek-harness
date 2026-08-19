@@ -11,12 +11,31 @@ this plugin implements all live in
 - Stores memories as plain markdown files with YAML frontmatter at a
   user-configured `vaultPath` — no database, git-diffable, human-editable.
 - Indexes them with hybrid BM25 + local-embedding vector search
-  (`@orama/orama` + `@xenova/transformers`), rebuilt in memory on every
-  plugin start.
+  (`@orama/orama` + `@xenova/transformers`); the Orama index itself is
+  rebuilt in memory on every plugin start (cheap — pure in-process
+  tokenization, no model inference), but **embeddings are cached** by
+  content hash (`embedding-cache.ts`, `.embedding-cache.json` in the vault)
+  — a note is only re-embedded when its content actually changed since the
+  last boot, including a hand-edit made outside `memory_remember`. See
+  designCognitiveBrainForDSH.md §5.1/§5.4 for why this matters beyond boot
+  cost: the same content hash is what makes a hand-edited note's stale
+  embedding get refreshed at all. The BM25 side explicitly sets Orama's
+  `threshold: 1` (its most lenient setting) — Orama's own default (`0`) is
+  its *strictest*, requiring near-total query-term overlap, and was
+  confirmed to return zero results for ordinary multi-word queries against
+  short notes (designCognitiveBrainForDSH.md §3.5).
 - Logs every create/update/delete to an append-only audit trail
   (`.audit-log.jsonl` in the vault).
 - Exposes five tools: `memory_remember`, `memory_recall`, `memory_list`,
   `memory_audit`, `memory_related`.
+- `memory_remember` optionally accepts a `resource` field (a canonical
+  source URL, OKF-compatible — see designCognitiveBrainForDSH.md §5.6) and
+  runs a cheap, LLM-free contradiction check (`contradiction.ts`): a
+  candidate note sharing a tag and matching one of eight fixed
+  negation-pattern pairs (`is`/`is not`, `enabled`/`disabled`, etc.,
+  adapted from cognitiveBrain's `ConflictDetector.ts`) is surfaced back as
+  an advisory `possibleContradiction` field — nothing is ever written to
+  `contradictedBy` automatically.
 - **Opt-in**: an LLM-extracted concept graph (nodes are concepts, not notes)
   built incrementally from new notes only — never backfilled over the
   existing vault — cached as disposable JSON (`.concept-graph.json`) and
@@ -86,6 +105,31 @@ it into the profile's own patch layer.
 4. Confirm it composed correctly with `pnpm dsh --profile <name> --dump-config`
    (it should appear as the last entry, under a `# == .../cordis.patch.yml`
    marker), then boot normally with `pnpm dsh --profile <name>`.
+5. **If the profile's `dsh.profile.bundles` is `["@deepseek-ai/dsh-base"]`
+   alone** (the default for any freshly created profile — `dsh plugin add`
+   never adds a second bundle), step 4's boot will appear to hang. This
+   isn't a bug: `dsh-base` alone has no plugin that reads `--help` or a task
+   argument at all (that's `headless-startup`/the web server's own arg
+   parser, each shipped only in its overlay bundle) — the full plugin tree,
+   including this one, activates fine and the process just sits idle with
+   nothing telling it what to do. See
+   [`docs/dsh-base-bundle-boot-hang.md`](../../docs/dsh-base-bundle-boot-hang.md)
+   for the full investigation (an earlier version of that doc misattributed
+   this to `@deepseek-ai/dsh-goal`; that's been corrected). Fix it by adding
+   an overlay bundle to the profile's `package.json`, matching the built-in
+   `web`/`headless` profiles:
+   ```json
+   {
+     "dsh": {
+       "profile": {
+         "bundles": ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-headless"]
+       }
+     }
+   }
+   ```
+   Do not try to work around the hang by disabling `@deepseek-ai/dsh-goal` in
+   `cordis.patch.yml` instead — that path was tried and does not produce a
+   working boot (see the doc above for what actually happens).
 
 **Windows-specific gotcha, found while verifying this**: if the profile
 directory (under `$DSH_HOME`, typically your user profile on `C:`) and the
@@ -113,7 +157,10 @@ wiki; a file watcher for hand-edited notes (restart to pick up out-of-band
 edits); `memory_forget`/`memory_reindex`/`memory_get` tools; multi-source
 ingestion (PDF/URL/Slack/WhatsApp); chunking of note content for embeddings
 (chunking exists only for concept-graph extraction); cross-device sync; a
-persisted on-disk search-index snapshot; an MCP server surface; any
+persisted on-disk snapshot of the Orama search index itself (its BM25/vector
+structures are still rebuilt in memory on every boot — cheap in-process
+work; only the embedding *computation* that used to dominate that cost is
+now cached, see above); an MCP server surface; any
 bulk/backfill tool to pull pre-existing or hand-written notes into the
 concept graph (a deliberate decision, not a gap — it only ever grows from
 new `memory_remember` calls going forward).
@@ -125,10 +172,14 @@ npm install
 npm test
 ```
 
-54 tests across 10 files, all hermetic — no live network calls, no real LLM
+76 tests across 12 files, all hermetic — no live network calls, no real LLM
 call, no model download. `enableEmbeddings: false` is the default test mode
 for the base plugin (fast, no model download in CI); concept-graph tests use
-a fake `ctx.llm`/`ctx.webServer` throughout, never a real call.
+a fake `ctx.llm`/`ctx.webServer` throughout, never a real call. The
+embedding cache's own hit/miss and vector-passthrough logic is covered by
+`embedding-cache.test.ts` and `memory-index.test.ts` with a fake
+`embeddingFn`, so the caching mechanism is verified without a real model
+download either.
 
 Covers: frontmatter round-trip, vault-store CRUD + tag filtering + path
 containment, hybrid search ranking (BM25-only and hybrid-with-embedding
@@ -173,24 +224,33 @@ steps above actually work. Findings, in the order they were hit:
    malformed junction). The workaround is documented above; the real fix
    would need to land in pnpm or in `dsh plugin add` itself, not in this
    plugin.
-5. **Full profile boot is currently blocked by an unrelated, pre-existing
-   repository build failure**, not by anything in this plugin. After fixing
-   1–4 above, booting the profile failed with `typert-loader: 2 typert
-   contributor(s) failed to register` for `@deepseek-ai/dsh-commands` and
-   `@deepseek-ai/dsh-goal` (their generated `lib/typert.host.js` files were
-   missing). Running the repo's full `pnpm run build` to generate them
-   surfaced the actual root cause: `tsc -b tsconfig.host.json` fails with
-   pre-existing type errors unrelated to this plugin —
-   `packages/web/web-fetch-http/src/policy.ts:78` (`string | undefined` not
-   assignable to `string`) and a stale test-fixture type mismatch in
-   `packages/web/tool-web/tests/integration.spec.ts:163` (`HttpFetchLimits`
-   missing `destinationPolicyMode`/`destinationAllowCidrs`). Neither file was
-   touched while building this plugin. Until those are fixed, no profile in
-   this checkout can complete a full boot — this is a pre-existing repo-wide
-   blocker, not specific to `dsh-plugin-knowledge-hub`, and is outside this
-   plugin's scope to fix.
+5. **Two unrelated, pre-existing repository build failures were fixed** —
+   not caused by this plugin, but blocking any profile boot until resolved:
+   `packages/web/web-fetch-http/src/policy.ts` (`string | undefined` not
+   assignable to `string` in `parseCidr()`) and a stale test fixture in
+   `packages/web/tool-web/tests/integration.spec.ts` missing two required
+   `HttpFetchLimits` fields. Both reproduce on unmodified `upstream/master`
+   too, so they were genuine platform bugs, not introduced by this session's
+   work.
+6. **A profile that uses only the bare `@deepseek-ai/dsh-base` bundle**
+   (which is exactly what `dsh plugin --profile <name> add <path>` produces
+   for a fresh profile, since it never adds a `dsh.profile.bundles` overlay)
+   appears to hang on boot. This is not a defect — `dsh-base` has no plugin
+   that reads `--help`/task args at all (that lives only in the
+   `dsh-headless`/`dsh-web-app` overlays), so the process boots successfully
+   and just sits idle with nothing telling it what to do. Full investigation
+   in [`docs/dsh-base-bundle-boot-hang.md`](../../docs/dsh-base-bundle-boot-hang.md)
+   (an earlier version of that doc misattributed this to
+   `@deepseek-ai/dsh-goal`; corrected after the "fix" it proposed was tested
+   and found not to change anything). **The actual fix is adding an overlay
+   bundle** (`@deepseek-ai/dsh-headless` or `@deepseek-ai/dsh-web-app`) to
+   the profile's `dsh.profile.bundles` list, matching the built-in
+   `headless`/`web` profiles.
 
 Net result: everything specific to this plugin — packaging, build output,
-profile installation, and Cordis config composition — is verified correct.
-A genuine full boot (tools actually callable inside a running DSH process)
-is blocked on the pre-existing build failure in item 5, not on this plugin.
+profile installation, and Cordis config composition — is verified correct,
+**and** a full end-to-end boot (with this plugin's tools actually mounted in
+a running DSH process, `--profile <name> --help` exiting 0, and a real task
+successfully reaching this plugin's tool registrations before failing only
+on an unrelated missing LLM credential) was achieved using the overlay-bundle
+workaround from `docs/dsh-base-bundle-boot-hang.md`.

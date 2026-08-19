@@ -17,6 +17,9 @@ import { formatFlightSearchOutput } from './format.ts'
 import { fetchFlightSearchHtml, FlightsNotFoundError, parseFlightSearchHtml } from './provider.ts'
 import type { FlightSearchQuery, SeatClass, TripType } from './query.ts'
 
+/** Services required before this plugin can register its tool. */
+export const inject = ['tools']
+
 /** Plugin config: search caps and defaults. */
 export interface Config {
   /** Upper bound on itineraries returned by one call. Defaults to 10. */

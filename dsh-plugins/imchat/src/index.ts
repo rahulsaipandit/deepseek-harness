@@ -24,6 +24,9 @@ import type { ChatAdapter, Platform } from './core/types.ts'
 import { TelegramAdapter } from './adapters/telegram.ts'
 import type { SlackEventsClient } from './adapters/slack.ts'
 
+/** Services required before this plugin can register its question provider and route sessions. */
+export const inject = ['agents', 'credentials', 'userQuestions']
+
 const identityEntrySchema = z.object({
   senderId: z.string(),
   approvalPolicy: z.union([z.const('ask'), z.const('never')]),

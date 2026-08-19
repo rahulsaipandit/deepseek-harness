@@ -20,6 +20,8 @@ export interface MemoryIndexDoc {
   createdAt: string
   confidence: number
   sourceCount: number
+  /** Precomputed embedding (e.g. from `embedding-cache.ts`) — when set, skips calling `embeddingFn` for this doc. */
+  vector?: number[]
 }
 
 export interface MemoryIndexResult {
@@ -110,7 +112,9 @@ export class MemoryIndex {
       // fine — doc may not exist yet
     }
     const oramaDoc = toOramaDoc(doc)
-    if (this.embeddingFn) {
+    if (doc.vector) {
+      oramaDoc.vector = doc.vector
+    } else if (this.embeddingFn) {
       oramaDoc.vector = await this.embeddingFn(doc.content || doc.title)
     }
     await insert(db, oramaDoc as never)
@@ -119,7 +123,7 @@ export class MemoryIndex {
   async indexMany(docs: MemoryIndexDoc[]): Promise<void> {
     if (this.embeddingFn) {
       const embeddingFn = this.embeddingFn
-      const embeddings = await Promise.all(docs.map(d => embeddingFn(d.content || d.title)))
+      const embeddings = await Promise.all(docs.map(d => d.vector ?? embeddingFn(d.content || d.title)))
       const db = this.ensureDb()
       for (let i = 0; i < docs.length; i++) {
         const doc = docs[i]
@@ -173,6 +177,16 @@ async function bm25Search(db: AnyOrama, query: string, limit: number): Promise<{
     term: query,
     limit,
     boost: { title: 2, content: 1, tags: 1.5 },
+    // Orama's own default (0) is its STRICTEST setting — it requires
+    // near-full query-term overlap and returns zero hits otherwise, which
+    // silently breaks any multi-word natural-language query against short
+    // notes (confirmed directly: "Dark mode is disabled now." found zero
+    // hits against a note containing "Dark mode is enabled..." at the
+    // default). threshold: 1 is Orama's most lenient setting — return
+    // every document sharing at least one token, ranked by score — which
+    // is the correct behavior for ranked search: let the score order
+    // results, don't let the search step silently drop them.
+    threshold: 1,
   } as never)) as unknown as { hits: { id: string; document: OramaDocument }[] }
   return result.hits
 }

@@ -11,7 +11,7 @@
  */
 
 import { spawnSync } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import { existsSync, lstatSync, readdirSync, readlinkSync, rmdirSync, symlinkSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import {
   DEFAULT_PROFILE_BUNDLES,
@@ -112,6 +112,79 @@ function anchorPathSpec(argument: string, cwd: string): string {
 }
 
 /**
+ * A malformed Windows junction target produced by a confirmed pnpm bug
+ * (pnpm@11.7.0, this repo's pinned version): when the profile directory and
+ * a linked package's checkout are on different drives, the junction pnpm
+ * creates points at the profile directory concatenated with the package's
+ * own absolute path (e.g. `C:\...\profiles\web\D:\Github\...\knowledge-hub`)
+ * instead of the absolute path alone — as if `path.join` were used where
+ * `path.resolve`/the bare absolute path was needed. Not fixable in this
+ * repo (the bug is inside pnpm itself); this repairs the junction
+ * afterward instead. The signature — one drive letter, then later another
+ * drive-letter path — never occurs in a well-formed absolute Windows path,
+ * so this is a safe, specific detector.
+ */
+const MALFORMED_JUNCTION_TARGET = /^[a-zA-Z]:[\\/].*[\\/]([a-zA-Z]:[\\/].+)$/
+
+/** Extract the real intended target from a malformed junction target, or `undefined` if it doesn't match the known bug shape. */
+function extractRealTarget(target: string): string | undefined {
+  return MALFORMED_JUNCTION_TARGET.exec(target)?.[1]
+}
+
+/** Yield every direct package entry under `node_modules`, resolving one level into `@scope/*` directories. */
+function * packageEntries(nodeModulesDir: string): Generator<{ name: string; path: string }> {
+  for (const name of readdirSync(nodeModulesDir)) {
+    const path = join(nodeModulesDir, name)
+    if (name.startsWith('@')) {
+      let scopedNames: string[]
+      try {
+        scopedNames = readdirSync(path)
+      } catch {
+        continue
+      }
+      for (const scoped of scopedNames) yield { name: `${name}/${scoped}`, path: join(path, scoped) }
+    } else {
+      yield { name, path }
+    }
+  }
+}
+
+/**
+ * Scan a profile's `node_modules` for junctions matching the known
+ * pnpm-on-Windows malformed-target bug and recreate each with its real,
+ * intended target. A no-op on non-Windows platforms and when the directory
+ * doesn't exist yet.
+ * @param nodeModulesDir - the profile's `node_modules` directory.
+ * @returns the package names whose junction was repaired.
+ */
+export function repairMalformedJunctions(nodeModulesDir: string): string[] {
+  if (process.platform !== 'win32' || !existsSync(nodeModulesDir)) return []
+  const repaired: string[] = []
+  for (const { name, path } of packageEntries(nodeModulesDir)) {
+    let stat: ReturnType<typeof lstatSync>
+    try {
+      stat = lstatSync(path)
+    } catch {
+      continue
+    }
+    if (!stat.isSymbolicLink()) continue
+    let target: string
+    try {
+      target = readlinkSync(path)
+    } catch {
+      continue
+    }
+    if (existsSync(target)) continue // already valid — including a correct, non-malformed junction
+    const realTarget = extractRealTarget(target)
+    if (realTarget === undefined || !existsSync(realTarget)) continue
+    rmdirSync(path) // removes the junction/reparse point itself, not its target's contents
+    symlinkSync(realTarget, path, 'junction')
+    repaired.push(name)
+  }
+  return repaired
+}
+
+/**
  * Run one `dsh plugin` invocation: init if needed, forward to pnpm, reconcile.
  * @param profile - the profile name.
  * @param args - pnpm arguments with relative path specs anchored to the invoking directory.
@@ -141,6 +214,10 @@ export function runPlugin(profile: string, args: readonly string[]): number {
   }
   const exitCode = result.status ?? 1
   if (exitCode === 0) {
+    const repaired = repairMalformedJunctions(join(dir, 'node_modules'))
+    for (const packageName of repaired) {
+      process.stderr.write(`${NAME}: repaired a malformed Windows junction for ${packageName} (known pnpm cross-drive bug)\n`)
+    }
     reconcilePlugins(before, dir)
   } else {
     // pnpm's own diagnostics name pnpm-workspace.yaml without saying WHICH
