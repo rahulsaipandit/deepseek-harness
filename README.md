@@ -17,7 +17,33 @@ DeepSeek Harness is currently in _developer preview_ and is iterating rapidly. *
 Install `Node.js`, then run:
 
 ```sh
+pnpm install
+pnpm run build
+pnpm dsh web
+
+There's also a published-package path — npx @deepseek-ai/dsh web - but you're working in this checkout, so use the build above
 npx @deepseek-ai/dsh web
+
+Other modes (apps/cli/README.md)
+pnpm dsh --profile <name>              # run a named profile
+pnpm dsh --profile headless "some job" # non-interactive
+pnpm dsh web                           # shorthand for --profile web
+
+To enable dsh-plugins/knowledge-hub in a running profile, since these plugins live deliberately outside the pnpm workspace (meant to be installed the way an external plugin would be, per dsh-plugins/README.md):
+pnpm dsh plugin --profile <name> add ../dsh-plugins/knowledge-hub
+pnpm dsh --profile <name>
+
+dsh plugin --profile <name> add <path> installs it into that profile and reconciles its declared plugin manifest into the profile's composed Cordis config; then a normal dsh --profile <name> run picks it up.
+
+One thing to flag: our plugin's Config requires vaultPath with no default (by design — see docs/designCognitiveBrainForDSH.md), so you'll need to set that via the profile's cordis.patch.yml overlay (the same mechanism examples/web-schedule/cordis.yml uses to insert plugin config) — something like:
+- insert:
+    - id: knowledge-hub
+      name: dsh-plugin-knowledge-hub
+      config:
+        vaultPath: /absolute/path/to/your/notes
+
+
+check the exact cordis.patch.yml your target profile already has and draft that insertion for it, or verify the dsh plugin add flow actually works end-to-end against our new plugin before you rely on it.
 ```
 
 The command starts the Web UI, served at `http://127.0.0.1:3080` by default. See [Web UI guide](docs/user/guide/index.md).
@@ -33,6 +59,33 @@ pnpm install
 pnpm run build
 pnpm dsh web
 ```
+
+### Other run modes
+
+```sh
+pnpm dsh --profile <name>              # run a named profile
+pnpm dsh --profile headless "some job" # run one job non-interactively, then exit
+pnpm dsh web                           # shorthand for --profile web
+```
+
+`dsh --dump-config` prints a profile's fully composed plugin configuration, useful when debugging what a profile actually loads.
+
+### Installing plugins
+
+Plugins — including everything under [`dsh-plugins/`](dsh-plugins/), which is deliberately kept outside this repository's package workspace so each one is installed the same way an external community plugin would be — are added to a profile with:
+
+```sh
+pnpm dsh plugin --profile <name> add <path-or-package-or-git-spec>
+pnpm dsh --profile <name>
+```
+
+For example, to add a local checkout of one of this repo's own `dsh-plugins/`:
+
+```sh
+pnpm dsh plugin --profile <name> add ../dsh-plugins/skillhub
+```
+
+`dsh plugin add` installs the package into the profile and reconciles its declared bundle manifest into the profile's composed Cordis configuration; a plugin's own required settings (e.g. a filesystem path it needs) are then set via that profile's `cordis.patch.yml` overlay. See [Web UI guide](docs/user/guide/index.md) and [architecture documentation](docs/architecture.md) for the full configuration-layering model.
 
 ## Community and support
 

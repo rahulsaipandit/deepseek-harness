@@ -15,6 +15,17 @@ without depending on this monorepo's internal build.
 
 ## Plugins
 
+- **[browser-bridge](./browser-bridge/)** — token-authenticated WebSocket
+  bridge plus a `browser_*` tool set for a companion Chrome MV3 extension
+  (`./browser-bridge/extension/`), a hardened port of the community
+  [`Lum1104/dsh-browser`](https://github.com/Lum1104/dsh-browser) project. See
+  its README and `docs/adr/rp_dshPlugins.md` for what was reviewed; the
+  security architecture (token auth with `timingSafeEqual`, the Origin-gated
+  loopback exception, privileged-method loopback pinning, per-action
+  approval, and the untrusted-content wrapper) was kept exactly as reviewed,
+  while multi-frame/iframe support, tab-affinity continuity, session
+  grouping/deferral, and i18n were simplified or dropped (disclosed in both
+  packages' "Trust and limitations" sections).
 - **[flight-search](./flight-search/)** — natural-language flight-price
   lookup tool, ported from
   [AWeirdDev/flights](https://github.com/AWeirdDev/flights) into a native
@@ -26,6 +37,14 @@ without depending on this monorepo's internal build.
   `docs/adr/rp_dshPlugin_imChat.md` for the design, the community plugins it
   learned from without adopting wholesale, and current adapter status
   (Telegram and Slack implemented against mock APIs, WhatsApp deferred).
+- **[skillhub](./skillhub/)** — `skillhub_search`/`install`/`list`/`uninstall`
+  tools that discover and manage skills from a configured registry, a
+  hardened take on the community
+  [`cocofhu/skillhub`](https://github.com/cocofhu/skillhub) project. See its
+  README and `docs/adr/rp_dshPlugins.md` for what was reviewed and what was
+  deliberately redesigned (no archive download/extraction; a same-origin
+  HTTP client by construction; an install ledger scoping what uninstall may
+  delete).
 - **[vision-bridge](./vision-bridge/)** — gives a text-only main model a way
   to describe images (`describe_image` tool): a configurable multi-provider
   vision-API catalog with offline OCR fallback. A deliberate hybrid of two

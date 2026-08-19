@@ -2,6 +2,14 @@
 
 DeepSeek Harness is a plugin-based agent harness on vendored Cordis: **everything is a plugin**. Read [docs/architecture.md](docs/architecture.md) before changing `packages/`; follow [docs/AGENTS.md](docs/AGENTS.md) for documentation.
 
+All model I/O goes through the `ctx.llm` seam (`LlmRuntime`, [docs/subsystems/llm-streaming.md](docs/subsystems/llm-streaming.md)): provider plugins register an `LlmAdapter` (`packages/llm/llm-deepseek` direct-fetch SSE, `packages/llm/llm-pi-ai` library-backed) that streams a provider-neutral `StreamChunk` protocol; no core code talks to a provider directly.
+
+`ContentBlockMap` is multimodal-ready (`ImageBlock` alongside text/reasoning/tool blocks) and `LlmModelInfo.inputModalities` advertises `text`/`image` per model, but wire support is per-adapter: `dsh-llm-deepseek` rejects image content (`UNSUPPORTED_CONTENT`, text-only chat-completions route); `dsh-llm-pi-ai` sends images when the resolved model declares `image` input.
+
+On the common text-only `dsh-llm-deepseek` route, there is no core path to get an image onto the wire. Third-party vision plugins (e.g. visionDS, dsh-plugin-mm-vision) fill this by registering a model-facing tool on `ctx.tools` — never by patching `ctx.llm` — that pre-converts an image to a text/coordinate description via OCR or an external vision-capable model, then returns that text as a normal tool result. This is a tool-level workaround, not a core capability.
+
+Skill discovery is documented in [docs/subsystems/skills.md](docs/subsystems/skills.md). The `SkillRegistry` (`packages/skill/skill`) scans ranked directories (`.dsh/skills` and `.agents/skills` in the project, `Config.customSkillDirs`, `<dshHome>/skills`, `<agentsHome>/skills`, bundled skill dirs) for `<name>/SKILL.md` bundles or flat `<name>.md` files, watched live via chokidar. `dsh-tool-skill` injects the resulting `<available_skills>` catalog into a system-reminder for the model, which loads one via `skill({ name })`; `SkillsApi.list` (`packages/host/apiproxy`) exposes the same catalog for the UI, where users invoke a skill by typing `/name` in the composer. Frontmatter (`disable-model-invocation`, `user-invocable`) controls whether a skill is model-visible, user-visible, or both.
+
 ## Pre-release stance: foundation over blast radius
 
 **Remove this section at the first tagged release.** With no external consumers, prefer the correct foundation over compatibility shims: rename or repackage freely and update every reference together. Backends reject old on-disk formats. SQLite uses monotonic `SCHEMA_VERSION`; `dsh-session` keeps `SESSION_FORMAT_VERSION` at `0` with no compatibility promise.

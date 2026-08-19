@@ -60,13 +60,17 @@ const V4_MAPPED_V6 = /^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/i
 function expandForPolicyCheck(address: string, family: 4 | 6): Array<{ address: string; family: 4 | 6 }> {
   if (family !== 6) return [{ address, family }]
   const mapped = V4_MAPPED_V6.exec(address)
-  if (mapped === null) return [{ address, family }]
-  return [{ address, family }, { address: mapped[1]!, family: 4 }]
+  const embeddedV4 = mapped?.[1]
+  if (embeddedV4 === undefined) return [{ address, family }]
+  return [{ address, family }, { address: embeddedV4, family: 4 }]
 }
 
 function parseCidr(cidr: string): { address: string; prefix: number; family: 4 | 6 } {
   const [address, prefixRaw] = cidr.split('/')
-  const family = isIP(address ?? '')
+  if (address === undefined) {
+    throw new WebError(`invalid destination allowlist CIDR address: ${cidr}`, 'WEB_INVALID_URL')
+  }
+  const family = isIP(address)
   if (family !== 4 && family !== 6) {
     throw new WebError(`invalid destination allowlist CIDR address: ${cidr}`, 'WEB_INVALID_URL')
   }
@@ -141,7 +145,11 @@ export async function resolveDestination(
     }
   }
 
-  return candidates[0]!
+  const first = candidates[0]
+  if (first === undefined) {
+    throw new WebError(`host "${url.hostname}" did not resolve to any IP address`, 'WEB_BLOCKED_URL')
+  }
+  return first
 }
 
 /**
