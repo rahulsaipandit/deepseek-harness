@@ -51,6 +51,32 @@ describe('MemoryIndex (BM25-only, no embeddingFn)', () => {
     expect(note).toBeDefined()
     expect(proc!.score).toBeGreaterThan(note!.score)
   })
+
+  /**
+   * Regression: BM25-only scores used to be purely rank-derived
+   * (`1/(60+rank)`), so a doc with much stronger real term overlap and one
+   * with only weak overlap came back with nearly identical scores (adjacent
+   * ranks differ by ~0.00027) — ranking ORDER was always correct (Orama
+   * pre-sorts by real relevance), but `score` itself was useless as a
+   * confidence signal. Fixed by normalizing the real BM25 score against the
+   * top hit instead of using rank. A doc sharing both query terms multiple
+   * times must now score far above one sharing only a single, incidental
+   * term — not a rank-adjacent near-tie.
+   */
+  it('scores reflect real relevance magnitude, not just rank order', async () => {
+    const index = new MemoryIndex()
+    await index.initialize()
+    await index.indexMany([
+      doc('strong', 'apple apple apple banana'),
+      doc('weak', 'apple something entirely unrelated'),
+    ])
+    const results = await index.search('apple banana', 10)
+    const strong = results.find(r => r.id === 'strong')
+    const weak = results.find(r => r.id === 'weak')
+    expect(strong).toBeDefined()
+    expect(weak).toBeDefined()
+    expect(strong!.score).toBeGreaterThan(weak!.score * 2)
+  })
 })
 
 describe('MemoryIndex (with a fake embeddingFn — hybrid path)', () => {

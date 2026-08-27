@@ -84,11 +84,12 @@ describe('apply', () => {
     expect(tools.size).toBe(0)
   })
 
-  it('registers exactly the five documented tools', () => {
+  it('registers exactly the six documented tools', () => {
     const { ctx, tools } = makeCtx()
     apply(ctx, Config({ vaultPath, enableEmbeddings: false }))
     expect([...tools.keys()].sort()).toEqual([
       'memory_audit',
+      'memory_consolidate',
       'memory_list',
       'memory_recall',
       'memory_related',

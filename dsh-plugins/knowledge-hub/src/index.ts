@@ -18,8 +18,11 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import { createAuditLog } from './audit-log.ts'
 import { chunkByHeading } from './chunking.ts'
 import { findContradiction } from './contradiction.ts'
+import { findConsolidationProposals } from './consolidation.ts'
+import type { ConsolidationCandidateNote, ConsolidationProposal } from './consolidation.ts'
 import { createLlmConceptExtractor } from './concept-extractor.ts'
 import { mergeNoteIntoGraph, readConceptGraphCache, writeConceptGraphCache } from './concept-graph.ts'
+import { findGraphNeighborNotes } from './graph-expansion.ts'
 import type { ConceptExtractor } from './concept-extractor.ts'
 import { createLocalEmbeddingFunction, type EmbeddingFunction } from './embedding.ts'
 import { hashContent, pruneEmbeddingCache, readEmbeddingCache, writeEmbeddingCache } from './embedding-cache.ts'
@@ -70,11 +73,38 @@ interface RecallArgs {
   query: string
   limit?: number
   tags?: string[]
+  /** Opt-in per-query concept-graph expansion (designCognitiveBrainForDSH.md §4). No-op when enableConceptGraph is off. */
+  expandWithGraph?: boolean
+  /** "merged" (default) appends graph hits to `results`; "separate" returns them in `graphExpandedResults` instead. */
+  graphResultPlacement?: 'merged' | 'separate'
+}
+
+interface RecallResultItem {
+  id: string
+  title: string
+  path: string
+  score: number
+  excerpt: string
+  tags: string[]
+  via: 'search' | 'graph'
+  /** Concept labels connecting this note to a direct hit — only present for via:'graph' items. */
+  viaConcepts?: string[]
 }
 
 interface ListArgs {
   tags?: string[]
   limit?: number
+  /** Include notes already marked supersededBy another note. Default false. */
+  includeSuperseded?: boolean
+}
+
+interface ConsolidateArgs {
+  /** Preview proposals without writing anything. Default true — a real run requires dryRun:false explicitly. */
+  dryRun?: boolean
+  /** Minimum cosine similarity to treat two notes as near-duplicates. Default 0.92. */
+  similarityThreshold?: number
+  /** Optional: only consider notes having ALL these tags. */
+  tags?: string[]
 }
 
 interface AuditArgs {
@@ -178,7 +208,11 @@ export function apply(ctx: Context, config: Config): void {
           ...(embeddingFn ? { embeddingFn } : {}),
         })
         await index.initialize()
-        const files = await vaultStore.list()
+        // Superseded notes stay on disk (never deleted, never rewritten
+        // beyond the supersededBy marker) but never re-enter search — this
+        // is what makes memory_consolidate's effect survive a restart,
+        // not just the live process that ran it.
+        const files = (await vaultStore.list()).filter(f => f.frontmatter.supersededBy === undefined)
 
         if (embeddingFn) {
           embeddingCache = pruneEmbeddingCache(
@@ -374,11 +408,13 @@ export function apply(ctx: Context, config: Config): void {
 
   ctx.tools.register(defineTool({
     name: 'memory_recall',
-    description: 'Search the knowledge hub by natural-language query (hybrid keyword + semantic search). Read-only.',
+    description: 'Search the knowledge hub by natural-language query (hybrid keyword + semantic search). Read-only. Optionally expand results through the opt-in concept graph.',
     parameters: {
       query: { type: 'string', required: true, description: 'Natural-language search query.' },
       limit: { type: 'number', description: 'Max results (default 5).' },
       tags: { type: 'array', items: { type: 'string' }, description: 'Optional: only return memories having ALL these tags.' },
+      expandWithGraph: { type: 'boolean', description: 'Opt-in: also pull in notes connected to the top hits via the concept graph (one hop). No-op if the concept graph is disabled for this vault — check graphExpansionAvailable in the result. Default false.' },
+      graphResultPlacement: { type: 'string', enum: ['merged', 'separate'], description: '"merged" (default): graph-expanded notes are appended to results, each marked via:"graph". "separate": they are returned in graphExpandedResults instead, keeping results to direct search hits only.' },
     },
     output: {
       schema: {
@@ -398,17 +434,40 @@ export function apply(ctx: Context, config: Config): void {
                 score: { type: 'number', required: true },
                 excerpt: { type: 'string', required: true },
                 tags: { type: 'array', required: true, items: { type: 'string' } },
+                via: { type: 'string', required: true, enum: ['search', 'graph'] },
+                viaConcepts: { type: 'array', items: { type: 'string' } },
               },
             },
           },
+          graphExpandedResults: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                id: { type: 'string', required: true },
+                title: { type: 'string', required: true },
+                path: { type: 'string', required: true },
+                score: { type: 'number', required: true },
+                excerpt: { type: 'string', required: true },
+                tags: { type: 'array', required: true, items: { type: 'string' } },
+                via: { type: 'string', required: true, enum: ['graph'] },
+                viaConcepts: { type: 'array', required: true, items: { type: 'string' } },
+              },
+            },
+          },
+          graphExpansionAvailable: { type: 'boolean', required: true },
         },
       },
-      render: (_args, value) => [{
-        type: 'text',
-        text: value.results.length === 0
+      render: (_args, value) => {
+        const direct = value.results.length === 0
           ? 'No matching memories found.'
-          : value.results.map(r => `"${r.title}" (score ${r.score.toFixed(2)}, tags: ${r.tags.join(',')}) — ${r.excerpt} [${r.path}]`).join('\n'),
-      }],
+          : value.results.map(r => `"${r.title}" (score ${r.score.toFixed(2)}, tags: ${r.tags.join(',')}${r.via === 'graph' ? `, via graph: ${(r.viaConcepts ?? []).join(', ')}` : ''}) — ${r.excerpt} [${r.path}]`).join('\n')
+        const expanded = value.graphExpandedResults && value.graphExpandedResults.length > 0
+          ? `\n\nAlso related via concept graph:\n${value.graphExpandedResults.map(r => `"${r.title}" (concepts: ${r.viaConcepts.join(', ')}) [${r.path}]`).join('\n')}`
+          : ''
+        return [{ type: 'text', text: direct + expanded }]
+      },
     },
     isConcurrencySafe: () => true,
     async execute(args: RecallArgs) {
@@ -416,7 +475,7 @@ export function apply(ctx: Context, config: Config): void {
       const limit = Math.min(Math.max(args.limit ?? 5, 1), config.maxRecallResults)
       const hits = await index.search(args.query, limit * (args.tags && args.tags.length > 0 ? 4 : 1))
 
-      const results: { id: string; title: string; path: string; score: number; excerpt: string; tags: string[] }[] = []
+      const results: RecallResultItem[] = []
       for (const hit of hits) {
         if (results.length >= limit) break
         const file = await vaultStore.read(hit.id)
@@ -429,9 +488,47 @@ export function apply(ctx: Context, config: Config): void {
           score: hit.score,
           excerpt: file.content.length > 300 ? `${file.content.slice(0, 300)}…` : file.content,
           tags: file.frontmatter.tags,
+          via: 'search',
         })
       }
-      return { results }
+
+      const graphExpansionAvailable = config.enableConceptGraph
+      const graphExpanded: (RecallResultItem & { via: 'graph'; viaConcepts: string[] })[] = []
+      if (args.expandWithGraph && graphExpansionAvailable) {
+        try {
+          const graph = await readConceptGraphCache(vaultPath)
+          const excludeIds = new Set(results.map(r => r.id))
+          const neighbors = findGraphNeighborNotes(graph, results.map(r => r.id), excludeIds)
+          for (const neighbor of neighbors) {
+            if (graphExpanded.length >= limit) break
+            const file = await vaultStore.read(neighbor.noteId)
+            if (!file) continue
+            if (args.tags && !args.tags.every(tag => file.frontmatter.tags.includes(tag))) continue
+            graphExpanded.push({
+              id: file.frontmatter.id,
+              title: file.frontmatter.title,
+              path: file.path,
+              score: 0,
+              excerpt: file.content.length > 300 ? `${file.content.slice(0, 300)}…` : file.content,
+              tags: file.frontmatter.tags,
+              via: 'graph',
+              viaConcepts: neighbor.viaConcepts,
+            })
+          }
+        } catch (error) {
+          ctx.logger?.warn?.(`knowledge-hub: graph expansion failed for memory_recall; returning direct search results only: ${String(error)}`)
+        }
+      }
+
+      const placement = args.graphResultPlacement ?? 'merged'
+      if (placement === 'separate') {
+        return {
+          results,
+          ...(graphExpanded.length > 0 ? { graphExpandedResults: graphExpanded } : {}),
+          graphExpansionAvailable,
+        }
+      }
+      return { results: [...results, ...graphExpanded], graphExpansionAvailable }
     },
     presentCall(args: RecallArgs) {
       return { card: 'generic', title: `Recall "${args.query}"`, kind: 'search' }
@@ -444,6 +541,7 @@ export function apply(ctx: Context, config: Config): void {
     parameters: {
       tags: { type: 'array', items: { type: 'string' }, description: 'Optional: only list memories having ALL these tags.' },
       limit: { type: 'number', description: 'Max results (default 50).' },
+      includeSuperseded: { type: 'boolean', description: 'Include notes marked supersededBy another note (see memory_consolidate). Default false.' },
     },
     output: {
       schema: {
@@ -479,7 +577,8 @@ export function apply(ctx: Context, config: Config): void {
     async execute(args: ListArgs) {
       await ensureInitialized()
       const files = await vaultStore.list(args.tags && args.tags.length > 0 ? { tags: args.tags } : undefined)
-      const sorted = [...files].sort((a, b) => b.frontmatter.createdAt.localeCompare(a.frontmatter.createdAt))
+      const visible = args.includeSuperseded ? files : files.filter(f => f.frontmatter.supersededBy === undefined)
+      const sorted = [...visible].sort((a, b) => b.frontmatter.createdAt.localeCompare(a.frontmatter.createdAt))
       const limit = args.limit ?? 50
       const items = sorted.slice(0, limit).map(file => ({
         id: file.frontmatter.id,
@@ -607,6 +706,124 @@ export function apply(ctx: Context, config: Config): void {
     },
     presentCall(args: RelatedArgs) {
       return { card: 'generic', title: `Find memories related to ${args.id}`, kind: 'search' }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'memory_consolidate',
+    description: 'Find redundant/superseded memories (near-duplicates, or notes contradicting a newer one) and, if confirmed, mark the older one supersededBy the newer — never deletes or rewrites content. Defaults to a dry-run preview.',
+    parameters: {
+      dryRun: { type: 'boolean', description: 'Preview proposals without writing anything. Default true — pass false explicitly to apply them.' },
+      similarityThreshold: { type: 'number', description: 'Minimum cosine similarity (0-1) to treat two notes as near-duplicates. Default 0.92. Ignored if embeddings are disabled for this vault.' },
+      tags: { type: 'array', items: { type: 'string' }, description: 'Optional: only consider notes having ALL these tags.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          proposals: {
+            type: 'array',
+            required: true,
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                action: { type: 'string', required: true, enum: ['merge', 'supersede'] },
+                keepId: { type: 'string', required: true },
+                keepTitle: { type: 'string', required: true },
+                supersedeIds: { type: 'array', required: true, items: { type: 'string' } },
+                supersedeTitles: { type: 'array', required: true, items: { type: 'string' } },
+                reason: { type: 'string', required: true },
+                similarity: { type: 'number' },
+              },
+            },
+          },
+          applied: { type: 'boolean', required: true },
+          mergeAvailable: { type: 'boolean', required: true },
+        },
+      },
+      render: (_args, value) => {
+        if (value.proposals.length === 0) return [{ type: 'text', text: 'No consolidation candidates found.' }]
+        const lines = value.proposals.map(p =>
+          `[${p.action}] keep "${p.keepTitle}" (${p.keepId}) — supersede ${p.supersedeTitles.map((t, i) => `"${t}" (${p.supersedeIds[i]})`).join(', ')}: ${p.reason}`,
+        )
+        const header = value.applied ? 'Applied:' : 'Proposed (dry run — pass dryRun:false to apply):'
+        return [{ type: 'text', text: `${header}\n${lines.join('\n')}` }]
+      },
+    },
+    isConcurrencySafe: () => false,
+    async execute(args: ConsolidateArgs) {
+      await ensureInitialized()
+      const dryRun = args.dryRun ?? true
+      const similarityThreshold = args.similarityThreshold ?? 0.92
+      if (!Number.isFinite(similarityThreshold) || similarityThreshold <= 0 || similarityThreshold > 1) {
+        throw new Error('memory_consolidate: similarityThreshold must be a number in (0, 1]')
+      }
+
+      const files = (await vaultStore.list(args.tags && args.tags.length > 0 ? { tags: args.tags } : undefined))
+        .filter(f => f.frontmatter.supersededBy === undefined)
+      const candidates: ConsolidationCandidateNote[] = files.map(f => ({
+        id: f.frontmatter.id,
+        title: f.frontmatter.title,
+        tags: f.frontmatter.tags,
+        createdAt: f.frontmatter.createdAt,
+        content: f.content,
+      }))
+
+      const mergeAvailable = embeddingFn !== null && embeddingCache !== undefined
+      const cache = embeddingCache
+      const rawProposals: ConsolidationProposal[] = findConsolidationProposals(candidates, {
+        similarityThreshold,
+        ...(mergeAvailable && cache ? { getEmbedding: (id: string) => cache.entries[id]?.embedding } : {}),
+      })
+
+      const titleById = new Map(candidates.map(c => [c.id, c.title]))
+      const proposals = rawProposals.map(p => ({
+        action: p.action,
+        keepId: p.keepId,
+        keepTitle: titleById.get(p.keepId) ?? p.keepId,
+        supersedeIds: p.supersedeIds,
+        supersedeTitles: p.supersedeIds.map(id => titleById.get(id) ?? id),
+        reason: p.reason,
+        ...(p.similarity !== undefined ? { similarity: p.similarity } : {}),
+      }))
+
+      let applied = false
+      if (!dryRun && rawProposals.length > 0) {
+        const index = await ensureInitialized()
+        const now = new Date().toISOString()
+        for (const proposal of rawProposals) {
+          for (const supersedeId of proposal.supersedeIds) {
+            const file = await vaultStore.read(supersedeId)
+            if (!file) continue
+            await vaultStore.write({
+              ...file,
+              frontmatter: { ...file.frontmatter, supersededBy: proposal.keepId, updatedAt: now },
+            })
+            await index.remove(supersedeId)
+            await auditLog.log({
+              operation: 'update',
+              entryId: supersedeId,
+              entryType: file.frontmatter.type,
+              summary: `Superseded by ${proposal.keepId} (${proposal.action}): ${proposal.reason}`,
+            })
+          }
+          if (proposal.action === 'supersede') {
+            const keepFile = await vaultStore.read(proposal.keepId)
+            if (keepFile) {
+              const contradictedBy = [...new Set([...(keepFile.frontmatter.contradictedBy ?? []), ...proposal.supersedeIds])]
+              await vaultStore.write({ ...keepFile, frontmatter: { ...keepFile.frontmatter, contradictedBy, updatedAt: now } })
+            }
+          }
+        }
+        applied = true
+      }
+
+      return { proposals, applied, mergeAvailable }
+    },
+    presentCall(args: ConsolidateArgs) {
+      return { card: 'generic', title: (args.dryRun ?? true) ? 'Preview memory consolidation' : 'Apply memory consolidation', kind: 'edit' }
     },
   }))
 }

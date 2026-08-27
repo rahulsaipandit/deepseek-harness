@@ -26,8 +26,8 @@ this plugin implements all live in
   short notes (designCognitiveBrainForDSH.md §3.5).
 - Logs every create/update/delete to an append-only audit trail
   (`.audit-log.jsonl` in the vault).
-- Exposes five tools: `memory_remember`, `memory_recall`, `memory_list`,
-  `memory_audit`, `memory_related`.
+- Exposes six tools: `memory_remember`, `memory_recall`, `memory_list`,
+  `memory_audit`, `memory_related`, `memory_consolidate`.
 - `memory_remember` optionally accepts a `resource` field (a canonical
   source URL, OKF-compatible — see designCognitiveBrainForDSH.md §5.6) and
   runs a cheap, LLM-free contradiction check (`contradiction.ts`): a
@@ -36,6 +36,13 @@ this plugin implements all live in
   adapted from cognitiveBrain's `ConflictDetector.ts`) is surfaced back as
   an advisory `possibleContradiction` field — nothing is ever written to
   `contradictedBy` automatically.
+- `memory_consolidate` finds redundant or superseded notes — near-duplicates
+  (embeddings-only, no LLM call) and contradicting tag-overlapping pairs
+  (the same LLM-free check `memory_remember` already runs) — and, only when
+  explicitly told to (`dryRun: false`; defaults to a dry-run preview), marks
+  the older note `supersededBy` the newer one. It never deletes or rewrites
+  a note's content, and every application is logged to the audit trail like
+  any other write. See "Consolidation" below.
 - **Opt-in**: an LLM-extracted concept graph (nodes are concepts, not notes)
   built incrementally from new notes only — never backfilled over the
   existing vault — cached as disposable JSON (`.concept-graph.json`) and
@@ -70,6 +77,76 @@ missing, or if `conceptGraphModel` is unset.
 
 `memory_remember`'s result includes `conceptGraphUrl` whenever the concept
 graph is enabled, so the agent can hand the URL to the user directly.
+
+### Per-query graph expansion in `memory_recall`
+
+`memory_recall` accepts two optional args to opt into the concept graph on
+a *per-query* basis, rather than the graph ever being consulted
+automatically:
+
+- `expandWithGraph?: boolean` (default `false`) — after the normal hybrid
+  search runs, also pull in notes connected to the top hits via the concept
+  graph (one hop: a note sharing a concept directly, or reachable via one
+  further `[[wikilink]]` edge). No-op (not an error) when
+  `enableConceptGraph` is off for this vault — check the always-present
+  `graphExpansionAvailable` field in the result to tell whether the flag
+  actually did anything.
+- `graphResultPlacement?: 'merged' | 'separate'` (default `'merged'`) —
+  `'merged'` appends graph-expanded notes to `results`, each marked
+  `via: 'graph'` with a `viaConcepts` field naming the connecting
+  concept(s); direct hits are marked `via: 'search'`. `'separate'` instead
+  returns graph-expanded notes in their own `graphExpandedResults` array,
+  keeping `results` to direct search hits only.
+
+This costs nothing beyond an in-memory graph walk — the concept graph is
+already built at write time (one bounded LLM call per new note), so
+traversing the cached graph per query needs no LLM call at all. Traversal
+depth is a parameter internally (`graph-expansion.ts`'s `findGraphNeighborNotes`,
+currently always called at its default of 1 hop) but not yet exposed on the
+tool schema, so it can grow later without a shape change.
+
+## Consolidation: reducing redundancy without an autonomous job or a rewrite
+
+A vault of small atomic notes accumulates redundancy over time — the same
+fact restated across sessions, or an old fact quietly contradicted by a
+newer one. `memory_consolidate` addresses this without either of the two
+things this design otherwise avoids: an autonomous background job silently
+mutating the vault, or any note's content ever being rewritten.
+
+**On-demand only.** There is no scheduler, no cron, no background timer —
+`memory_consolidate` runs only when explicitly called, and defaults to
+`dryRun: true` (a preview of proposals; nothing is written until a caller
+passes `dryRun: false`).
+
+**Two proposal types, both built from existing primitives — no new LLM
+call:**
+- **`supersede`** — two notes sharing a tag whose content asserts opposite
+  sides of one of `contradiction.ts`'s eight negation-pattern pairs (the
+  same LLM-free check `memory_remember` already runs at write time). The
+  newer note is kept; the older is proposed for supersession.
+- **`merge`** — two or more tag-overlapping notes whose embeddings are
+  near-duplicates (cosine similarity ≥ `similarityThreshold`, default
+  `0.92`). Requires `enableEmbeddings`; when it's off, `memory_consolidate`
+  still runs (contradiction detection needs no embeddings) but reports
+  `mergeAvailable: false` and proposes no merges. A cluster of 3+ mutual
+  near-duplicates collapses into one proposal, keeping the newest.
+
+**Applying a proposal (`dryRun: false`) only ever adds one frontmatter
+field** — `supersededBy: <keepId>` on the superseded note(s) — never
+deletes a file, never rewrites a note's body, never touches the kept note's
+content. For a `supersede` proposal, the kept (newer) note additionally
+gets the existing `contradictedBy` field populated with the superseded
+note's id — `memory_consolidate` is the confirmation step
+designCognitiveBrainForDSH.md §5.6 said that field was waiting on. Every
+application is logged to the audit trail as an ordinary `update` operation,
+exactly like any other mutation.
+
+**Superseded notes are hidden from default retrieval, not deleted.**
+`memory_recall`/`memory_related` stop surfacing a superseded note because
+it's removed from the live search index (and never re-indexed on the next
+boot); `memory_list` filters it out by default too, via a new
+`includeSuperseded?: boolean` arg (default `false`) that still finds it,
+content fully intact, when explicitly asked.
 
 ## Enabling this plugin in a DSH profile
 
@@ -172,7 +249,7 @@ npm install
 npm test
 ```
 
-87 tests across 13 files. `enableEmbeddings: false` is the default test mode
+117 tests across 15 files. `enableEmbeddings: false` is the default test mode
 for the base plugin (fast, no model download in CI); concept-graph tests use
 a fake `ctx.llm`/`ctx.webServer` throughout, never a real call. The
 embedding cache's own hit/miss and vector-passthrough logic is covered by
@@ -182,16 +259,19 @@ download either.
 
 Covers: frontmatter round-trip, vault-store CRUD + tag filtering + path
 containment, hybrid search ranking (BM25-only and hybrid-with-embedding
-paths), audit-log append/filter, the full plugin end-to-end (all five tools,
+paths), audit-log append/filter, the full plugin end-to-end (all six tools,
 including the startup rescan picking up hand-written files), heading-based
 chunking, wikilink extraction/resolution, concept-graph incremental merge
 (idempotency, same-file vs. cross-file edge scope, degree/community
 recomputation, cache round-trip), concept extraction's JSON-response parsing
-and graceful degradation on malformed output, and the concept-graph web
-server's route registration.
+and graceful degradation on malformed output, the concept-graph web server's
+route registration, one-hop concept-graph expansion (`graph-expansion.test.ts`),
+and consolidation proposal-finding (`consolidation.test.ts` — supersede via
+contradiction, merge via a fake embedding function, tag-overlap prefiltering,
+multi-note cluster collapsing).
 
 **`tests/agent-chat-integration.test.ts`** is the one exception to
-"hermetic": it drives all five tools through a real Cordis `Context` +
+"hermetic": it drives all six tools through a real Cordis `Context` +
 `ToolRuntime` (`ctx.tools.execute()`, the same dispatch path a real agent
 uses — not `ToolDefinition.execute()` called directly, which every other
 test file uses), simulating a multi-turn chat session — facts told across
@@ -212,7 +292,15 @@ real scores, so hybrid search's runner-up ordering for 3+ notes was
 noise-dominated rather than semantic. Both are fixed; see
 designCognitiveBrainForDSH.md §3.5 for the full writeup. Regression-covered
 by a deterministic test in `memory-index.test.ts` and by this suite's
-real-embeddings `memory_related` test.
+real-embeddings `memory_related` test. A related, narrower issue found
+during that same work — BM25-only mode's returned `score` values were also
+rank-derived rather than real relevance magnitude (ranking order was always
+correct; the number itself wasn't a usable confidence signal) — is fixed
+the same way, with its own regression test in `memory-index.test.ts`. It's
+also where `memory_consolidate`'s
+dry-run/apply behavior, audit logging, and default-hidden-but-not-deleted
+superseded notes are exercised end to end, including a real-embeddings
+merge case.
 
 ## Appendix: end-to-end verification session
 

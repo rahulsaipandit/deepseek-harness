@@ -55,11 +55,6 @@ interface RetrievalWeights {
 /** Single fixed weight preset — no per-query intent classification. */
 const WEIGHTS: RetrievalWeights = { similarity: 0.4, recency: 0.2, reliability: 0.4 }
 
-/** Reciprocal Rank Fusion score. */
-function rrfScore(rank: number, k = 60): number {
-  return 1 / (k + rank)
-}
-
 function toOramaDoc(doc: MemoryIndexDoc): OramaDocument {
   return {
     id: doc.id,
@@ -213,10 +208,23 @@ async function vectorSearch(db: AnyOrama, queryEmbedding: number[], limit: numbe
   return result.hits
 }
 
-/** Rank-only scoring, plus the `type==='procedure'` boost — the one CB heuristic kept, since it's cheap and graph-free. */
-function applyRankedScores(hits: { id: string; document: OramaDocument }[], topK: number): MemoryIndexResult[] {
+/**
+ * Magnitude-based scoring (min-max normalized against the top hit), plus the
+ * `type==='procedure'` boost — the one CB heuristic kept, since it's cheap
+ * and graph-free. Previously rank-only (`1 / (60 + rank)`): ranking ORDER was
+ * always correct (Orama's own `hits` array is already sorted by real BM25
+ * relevance before this function runs), but the returned `score` values
+ * were rank-derived rather than reflecting true relevance magnitude — two
+ * runner-up hits could carry nearly identical scores regardless of how much
+ * their real BM25 relevance actually differed, making `score` unusable as a
+ * confidence signal in BM25-only mode (`enableEmbeddings: false`). Fixed the
+ * same way `fuseHybrid()` was (designCognitiveBrainForDSH.md §3.5): use the
+ * real score, normalized to a [0, 1] range relative to the top hit.
+ */
+function applyRankedScores(hits: { id: string; score: number; document: OramaDocument }[], topK: number): MemoryIndexResult[] {
+  const maxScore = hits[0]?.score ?? 0
   return hits
-    .map((hit, rank) => ({ id: hit.id, score: rrfScore(rank) + (hit.document.type === 'procedure' ? 0.1 : 0) }))
+    .map(hit => ({ id: hit.id, score: normalizedScore(hit.score, maxScore) + (hit.document.type === 'procedure' ? 0.1 : 0) }))
     .sort((a, b) => b.score - a.score)
     .slice(0, topK)
 }

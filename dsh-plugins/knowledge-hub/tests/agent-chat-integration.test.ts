@@ -235,6 +235,15 @@ describe('agent chat session — memory + RAG (hybrid search), hermetic', () => 
     const ids = recalled.results.map((r: { id: string }) => r.id)
     expect(ids).toEqual(expect.arrayContaining([turn1.id, turn2.id]))
   })
+
+  it('expandWithGraph is a no-op when the concept graph is disabled for this vault', async () => {
+    await callTool(ctx, 'memory_remember', { title: 'Solo note', content: 'Nothing to connect it to.' })
+
+    const recalled = await callTool(ctx, 'memory_recall', { query: 'solo note', expandWithGraph: true, graphResultPlacement: 'separate' })
+    expect(recalled.graphExpansionAvailable).toBe(false)
+    expect(recalled.graphExpandedResults).toBeUndefined()
+    expect(recalled.results.every((r: { via: string }) => r.via === 'search')).toBe(true)
+  })
 })
 
 describe.skipIf(realEmbeddingFn === null)('agent chat session — semantic augmentation (real local embeddings)', () => {
@@ -394,4 +403,177 @@ describe('agent chat session — concept graph augmentation (fake ctx.llm, no ne
     expect(labels).toContain('Follow-up API notes')
     expect(labels).toContain('GraphQL schema design')
   })
+
+  it('memory_recall with expandWithGraph pulls in a note found only via a shared concept, merged into results by default', async () => {
+    provideFakeLlmAndWebServer([
+      ['GraphQL schema design'],
+      ['GraphQL schema design'],
+    ])
+    apply(ctx, Config({
+      vaultPath, enableEmbeddings: false, enableConceptGraph: true, conceptGraphModel: 'test-model',
+    }))
+
+    const noteA = await callTool(ctx, 'memory_remember', {
+      title: 'API design notes',
+      content: 'Discussed the schema of our new API today.',
+    })
+    // No vocabulary overlap with noteA or the query below — only the fake
+    // LLM's identical extracted concept connects the two.
+    const noteB = await callTool(ctx, 'memory_remember', {
+      title: 'Database indexing tips',
+      content: 'Learned about composite indexes for faster queries.',
+    })
+
+    // limit: 1 caps direct hybrid search to noteA alone, so noteB's presence
+    // below can only come from graph expansion, not from search leniency.
+    const merged = await callTool(ctx, 'memory_recall', { query: 'API design discussion today', limit: 1, expandWithGraph: true })
+    expect(merged.graphExpansionAvailable).toBe(true)
+    expect(merged.results.find((r: { id: string }) => r.id === noteA.id)?.via).toBe('search')
+    const graphHit = merged.results.find((r: { id: string }) => r.id === noteB.id)
+    expect(graphHit?.via).toBe('graph')
+    expect(graphHit?.viaConcepts).toContain('GraphQL schema design')
+    expect(merged.graphExpandedResults).toBeUndefined()
+
+    const separate = await callTool(ctx, 'memory_recall', { query: 'API design discussion today', limit: 1, expandWithGraph: true, graphResultPlacement: 'separate' })
+    expect(separate.results).toHaveLength(1)
+    expect(separate.results[0].id).toBe(noteA.id)
+    expect(separate.graphExpandedResults).toHaveLength(1)
+    expect(separate.graphExpandedResults[0].id).toBe(noteB.id)
+    expect(separate.graphExpandedResults[0].via).toBe('graph')
+
+    const withoutExpansion = await callTool(ctx, 'memory_recall', { query: 'API design discussion today', limit: 1 })
+    expect(withoutExpansion.results.map((r: { id: string }) => r.id)).not.toContain(noteB.id)
+    expect(withoutExpansion.graphExpandedResults).toBeUndefined()
+  })
+})
+
+describe('agent chat session — memory consolidation (dedup/supersede), hermetic', () => {
+  let vaultPath: string
+  let ctx: Context
+
+  beforeEach(async () => {
+    vaultPath = await mkdtemp(join(tmpdir(), 'knowledge-hub-consolidate-'))
+    ctx = await mountRegistry()
+    apply(ctx, Config({ vaultPath, enableEmbeddings: false }))
+  })
+
+  afterEach(async () => {
+    await ctx.fiber.dispose()
+    await rm(vaultPath, { recursive: true, force: true })
+  })
+
+  it('defaults to a dry run: proposes superseding a stale, contradicted note without writing anything', async () => {
+    const older = await callTool(ctx, 'memory_remember', {
+      title: 'Theme preference',
+      content: 'Dark mode is enabled for all editors.',
+      tags: ['preferences', 'theme'],
+    })
+    const newer = await callTool(ctx, 'memory_remember', {
+      title: 'Theme preference updated',
+      content: 'Dark mode is disabled now.',
+      tags: ['preferences', 'theme'],
+    })
+
+    const preview = await callTool(ctx, 'memory_consolidate', {})
+    expect(preview.applied).toBe(false)
+    expect(preview.proposals).toHaveLength(1)
+    expect(preview.proposals[0]).toMatchObject({ action: 'supersede', keepId: newer.id, supersedeIds: [older.id] })
+
+    // Nothing was written — the older note is still a normal, visible entry.
+    const listed = await callTool(ctx, 'memory_list', {})
+    expect(listed.items.map((i: { id: string }) => i.id)).toContain(older.id)
+  })
+
+  it('applying a supersede proposal marks the older note supersededBy, links contradictedBy on the newer one, logs the audit trail, and hides the older note from default retrieval', async () => {
+    const older = await callTool(ctx, 'memory_remember', {
+      title: 'Theme preference',
+      content: 'Dark mode is enabled for all editors.',
+      tags: ['preferences', 'theme'],
+    })
+    const newer = await callTool(ctx, 'memory_remember', {
+      title: 'Theme preference updated',
+      content: 'Dark mode is disabled now.',
+      tags: ['preferences', 'theme'],
+    })
+
+    const result = await callTool(ctx, 'memory_consolidate', { dryRun: false })
+    expect(result.applied).toBe(true)
+    expect(result.proposals).toHaveLength(1)
+
+    // The default memory_list view no longer shows the superseded note...
+    const defaultList = await callTool(ctx, 'memory_list', {})
+    expect(defaultList.items.map((i: { id: string }) => i.id)).not.toContain(older.id)
+    // ...but it's not gone — includeSuperseded still finds it, content intact.
+    const fullList = await callTool(ctx, 'memory_list', { includeSuperseded: true })
+    expect(fullList.items.map((i: { id: string }) => i.id)).toContain(older.id)
+
+    // memory_recall (backed by the search index) no longer surfaces it either.
+    const recalled = await callTool(ctx, 'memory_recall', { query: 'dark mode editor theme' })
+    expect(recalled.results.map((r: { id: string }) => r.id)).not.toContain(older.id)
+    expect(recalled.results.map((r: { id: string }) => r.id)).toContain(newer.id)
+
+    // The mutation itself is auditable, same as any other write.
+    const audited = await callTool(ctx, 'memory_audit', { entryId: older.id })
+    expect(audited.events.some((e: { operation: string; summary: string }) => e.operation === 'update' && e.summary.includes('Superseded'))).toBe(true)
+  })
+
+  it('does not propose superseding notes that share no tag, even if content contradicts', async () => {
+    await callTool(ctx, 'memory_remember', { title: 'A', content: 'Dark mode is enabled.', tags: ['topic-a'] })
+    await callTool(ctx, 'memory_remember', { title: 'B', content: 'Dark mode is disabled.', tags: ['topic-b'] })
+
+    const preview = await callTool(ctx, 'memory_consolidate', {})
+    expect(preview.proposals).toEqual([])
+  })
+
+  it('reports mergeAvailable:false and finds no merge proposals when embeddings are disabled', async () => {
+    await callTool(ctx, 'memory_remember', { title: 'Note one', content: 'Rahul likes dark mode.', tags: ['preferences'] })
+    await callTool(ctx, 'memory_remember', { title: 'Note two', content: 'Rahul likes dark mode.', tags: ['preferences'] })
+
+    const preview = await callTool(ctx, 'memory_consolidate', {})
+    expect(preview.mergeAvailable).toBe(false)
+    expect(preview.proposals.some((p: { action: string }) => p.action === 'merge')).toBe(false)
+  })
+})
+
+describe.skipIf(realEmbeddingFn === null)('agent chat session — memory consolidation, merge (real local embeddings)', () => {
+  let vaultPath: string
+
+  beforeEach(async () => {
+    vaultPath = await mkdtemp(join(tmpdir(), 'knowledge-hub-consolidate-merge-'))
+  })
+
+  afterEach(async () => {
+    await rm(vaultPath, { recursive: true, force: true })
+  })
+
+  it('merges two near-duplicate notes, keeping the newer one, without rewriting its content', async () => {
+    const ctx = await mountRegistry()
+    apply(ctx, Config({ vaultPath, enableEmbeddings: true }))
+
+    const older = await callTool(ctx, 'memory_remember', {
+      title: 'Editor theme',
+      content: 'Rahul prefers dark-mode editors and switches themes within minutes of installing a new tool.',
+      tags: ['preferences'],
+    })
+    const newer = await callTool(ctx, 'memory_remember', {
+      title: 'Editor theme (restated)',
+      content: 'Rahul always prefers dark-mode editors, switching themes soon after installing any new tool.',
+      tags: ['preferences'],
+    })
+
+    const result = await callTool(ctx, 'memory_consolidate', { dryRun: false })
+    expect(result.mergeAvailable).toBe(true)
+    const mergeProposal = result.proposals.find((p: { action: string }) => p.action === 'merge')
+    expect(mergeProposal).toMatchObject({ keepId: newer.id, supersedeIds: [older.id] })
+
+    const fullList = await callTool(ctx, 'memory_list', { includeSuperseded: true })
+    const olderEntry = fullList.items.find((i: { id: string }) => i.id === older.id)
+    expect(olderEntry).toBeDefined()
+
+    const defaultList = await callTool(ctx, 'memory_list', {})
+    expect(defaultList.items.map((i: { id: string }) => i.id)).not.toContain(older.id)
+    expect(defaultList.items.map((i: { id: string }) => i.id)).toContain(newer.id)
+
+    await ctx.fiber.dispose()
+  }, 120_000)
 })

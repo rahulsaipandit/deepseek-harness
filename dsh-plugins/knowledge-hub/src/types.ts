@@ -19,6 +19,8 @@ export interface MemoryFrontmatter {
   resource?: string | null
   /** Ids of other memories this one plausibly contradicts. Never set automatically — `memory_remember` only ever *surfaces* a possible contradiction (§5.6); writing this field requires a person or agent to confirm it. */
   contradictedBy?: string[]
+  /** Id of the note that supersedes this one — set only by `memory_consolidate` applying a confirmed merge/supersede proposal (designCognitiveBrainForDSH.md §8). The file's body is never rewritten; this is the only mutation that ever happens to an existing note. */
+  supersededBy?: string
 }
 
 /** A parsed memory file: frontmatter plus its markdown body. */

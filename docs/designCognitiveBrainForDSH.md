@@ -1,8 +1,10 @@
 # Cognitive Brain for DSH: a Hub-and-Spoke Personal Knowledge Hub
 
-Status: **implemented** as `dsh-plugins/knowledge-hub/` — all five base tools
-plus the opt-in concept graph described in §4, with 54 passing tests and a
-clean typecheck. This document lays out the architecture for turning
+Status: **implemented** as `dsh-plugins/knowledge-hub/` — six tools (five
+base tools plus `memory_consolidate`, §8), the opt-in concept graph
+described in §4 with per-query graph expansion (§4.4), and 118 passing
+tests with a clean typecheck. This document lays out the architecture for
+turning
 DeepSeek Harness (DSH) into the personal knowledge hub described in
 [`docs/knowledge-hub-architecture.md`](./knowledge-hub-architecture.md),
 using `docs/packages/cognitiveBrain` as a source of reusable memory logic —
@@ -309,6 +311,22 @@ with a true BM25 tie across three documents, so only vector magnitude can
 explain the expected ranking) and by the real-embeddings integration test
 in `agent-chat-integration.test.ts`.
 
+**A related, narrower issue, fixed the same day:** `applyRankedScores()` —
+the BM25-*only* path used when `enableEmbeddings` is off — had the identical
+rank-only flaw as `fuseHybrid()`, just never noticed because ranking ORDER
+was always correct (Orama's own `hits` array is pre-sorted by real
+relevance, and rank-only scoring can't invert an already-correct order for
+the top position). The returned `score` VALUES, though, were purely
+`1/(60+rank)` — a doc with overwhelmingly stronger term overlap and one with
+only a single incidental shared word came back with scores differing by
+~0.00027, making `score` useless as a confidence signal in this mode, even
+though nothing was ever mis-ranked. Fixed by applying the same min-max
+normalization `fuseHybrid()` uses: `score / topHitScore`. Verified directly:
+a doc repeating both query terms scored `1.0` against a doc sharing only one
+incidental term at `~0.14`, versus the old `~0.017` vs. `~0.016`. Regression
+test in `memory-index.test.ts` confirmed to fail against the pre-fix code
+(asserts a >2x score gap that the rank-only formula could never produce).
+
 ## 4. Two graphs are not a contradiction: the concept graph addendum
 
 Rejecting `InProcessGraph` (§2.2) and then adding a *different* graph
@@ -381,6 +399,58 @@ Tolaria validated at real vault scale, avoiding a `d3-force`/`cytoscape`
 dependency) plus a small JSON data route reading the current cache file.
 `memory_remember`'s result text includes the graph's URL when the feature is
 enabled, so the agent can hand it to the user directly.
+
+### 4.4 Per-query graph expansion: closing the "no queryable graph" gap, opt-in
+
+**Implemented (2026-08-19).** A follow-up comparison against GBrain's `entity`
+verb surfaced a real, narrower gap distinct from the traversal question §4
+already settled: GBrain lets an agent *query* its graph as part of the normal
+tool surface; this plugin's concept graph, until now, was reachable only as a
+passive web visualization (§4.3) — no tool could read it. Query-time
+traversal itself was correctly rejected (the automatic, every-search version
+is exactly GBrain's token-cost problem), but "no way to ever query the graph
+from a tool call" was a gap, not a decision.
+
+Closed via an **opt-in, per-query** flag rather than automatic traversal,
+which is the actual reason this doesn't reopen the rejected question:
+`memory_recall` now accepts `expandWithGraph?: boolean` (default `false`).
+When set, and only when `enableConceptGraph` is on for the vault, it looks up
+the concepts attached to the hybrid search's top hits in the cached
+`concept-graph.json` and walks one edge hop out (`graph-expansion.ts`'s
+`findGraphNeighborNotes`) to find other notes connected via a shared concept
+or a `[[wikilink]]` edge that hybrid search didn't already surface. This
+costs no LLM call at query time — the graph itself was already built
+incrementally at write time (§4.1) — so the only cost is an in-memory walk,
+bounded and paid only when a caller explicitly asks for it, never on every
+`memory_recall`. When `enableConceptGraph` is off, the flag is silently a
+no-op rather than an error; the result's `graphExpansionAvailable` field
+tells the caller whether expansion actually ran.
+
+**Placement is caller-selectable**, resolving a design question raised
+directly: whether graph-expanded hits should be merged into the normal
+ranked results or kept visibly separate. `graphResultPlacement?: 'merged' |
+'separate'` (default `'merged'`) lets the caller choose per query — `'merged'`
+appends graph hits to `results` marked `via: 'graph'` (direct hits are
+`via: 'search'`), `'separate'` returns them in their own
+`graphExpandedResults` array instead, keeping `results` to direct hits only.
+Neither is privileged as "more correct" — an agent that wants one ranked list
+to hand to a model uses `'merged'`; one that wants to tell the two apart
+explicitly (e.g. to caveat graph-derived suggestions differently) uses
+`'separate'`.
+
+**Traversal depth is a parameter, not a decision baked into the shape.**
+`findGraphNeighborNotes(graph, sourceNoteIds, excludeNoteIds, hops = 1)`
+takes `hops` as an argument; `memory_recall` always calls it at the default
+today, and the tool schema doesn't expose it yet — ships at 1 hop
+deliberately narrow, per this design's general v1 posture, but extending
+depth later (or exposing it as a tool arg) is a call-site change, not a
+rewrite. One structural note from building this: a W2 (same-file)
+concept-concept edge only ever connects two concepts *both* produced by the
+same note's own chunks, so it can never reveal a note beyond that note's own
+hop-0 frontier — genuine hop-1-only discovery in the current graph shape
+comes exclusively from W1 wikilink note-note edges. Not a bug, just a
+property of how `concept-graph.ts` builds edges, worth knowing before
+reaching for `hops > 1` expecting it to surface more via W2 alone.
 
 ## 5. Why this is a lightweight GBrain, not a reimplementation of it
 
@@ -738,6 +808,48 @@ architectural rewrite — recorded here as scoped next steps, not built now:
   actual report of `memory_recall` returning stale content after a
   hand-edit made during a long-running session.
 
+### 5.9 A second GBrain comparison (2026-08-27): pluggable multi-KB engines, skills benchmarking, CLI orchestration, gateways, audit, backfill, self-update
+
+A follow-up question posed a longer, more marketing-shaped description of
+GBrain's own feature set — paraphrased: *"manages knowledge as structured
+data through a pluggable engine architecture, connections to multiple
+knowledge bases; a skills system that orchestrates how inputs resolve into
+actions, with skills continuously optimized against benchmarks through an
+automated process; an AI agent 'brain layer' providing synthesis, knowledge
+graph traversal, and gap analysis; the main entry point for CLI operations,
+orchestrating command dispatch, configuration, and connections to
+processing engines; managing AI gateways and models, generating advisory
+recommendations, comprehensive audit logging, backfill operations, and
+self-update mechanisms"* — and asked whether DSH's architecture does the
+same. Each claim was checked directly against DSH's real source (not
+`docs/packages/cognitiveBrain`, which is a vendored reference copy, and not
+assumed from memory):
+
+| Claim | Found in DSH? | What's actually there |
+|---|---|---|
+| Pluggable engine managing **multiple** knowledge bases | **No, narrower.** | `knowledge-hub`'s `VaultStore` is one flat-directory markdown vault, one configurable path — "Local filesystem only — no MCP, no remote vault provider" per its own doc comment. No registry lets multiple heterogeneous KB backends be swapped in or run simultaneously; DSH's general Cordis-plugin pattern is whole-app composition, not a knowledge-base-specific multi-engine abstraction. |
+| Skills **continuously optimized against benchmarks** through automation | **Not found.** | `packages/skill/skill` and `dsh-plugins/skillhub` install/manage skills as authored artifacts (registry, install, state). No benchmark suite, scoring loop, A/B testing, or auto-tuning code exists anywhere in the repo. Skills are written and installed, never measured or iterated on automatically. |
+| "Brain layer": synthesis, graph traversal, gap analysis, nuanced answers not raw search | **Already settled — reconfirmed.** | §2.2/§4/§6.1 already reject this for `knowledge-hub` specifically. This pass confirmed the negative more broadly: `KnowledgeGapDetector.ts` and similar DO exist in this repo, but only inside `docs/packages/cognitiveBrain/` — GBrain's own vendored source, not DSH code. No other DSH subsystem does query-time graph traversal or gap analysis. |
+| Main CLI entry point orchestrating dispatch/config/engine connections | **Yes, real match.** | `apps/cli/src/bin.ts` is the executable entry; `profile-boot.ts`/`plugin.ts` drive Cordis profile/plugin boot; `args.ts` handles command dispatch/config parsing; the bundle packages (`base`, `headless`, `web-app`) wire in engines (`llm`, `skill`, `knowledge-hub`, etc.) as Cordis services. This is a genuine, pre-existing DSH capability at the whole-application level — nothing to adopt, it's already the CLI's job. |
+| Managing AI gateways and models | **Yes, narrower/differently shaped.** | `packages/llm/llm` (`ctx.llm`, `LlmRuntime`) is a real multi-provider adapter registry (`llm-deepseek`, `llm-pi-ai`, etc.). `packages/api/gateway` is a false match to rule out explicitly — its own README describes it as internal Host↔Client RPC dispatch, unrelated to model/provider gateway concerns. |
+| Generating advisory recommendations | **Not found.** | No general recommendation-generation subsystem exists anywhere in `packages/` or `dsh-plugins/`. |
+| Comprehensive (system-wide) audit logging | **Narrower than it sounds.** | Only `dsh-plugins/knowledge-hub/src/audit-log.ts` exists (§3.3). No cross-plugin or system-wide audit log package. |
+| Backfill operations | **Not found, and explicitly rejected where it would matter most.** | No general backfill mechanism exists anywhere in DSH. `knowledge-hub`'s concept graph explicitly states "never backfilled," "no bulk-backfill tool" (§4.1, §9) — a deliberate decision, not a gap to close. |
+| Self-update mechanisms | **Not found.** | No update-checker or self-update code anywhere in `apps/cli`; only unrelated hits were Dependabot (dev-time dependency bumps, not a runtime/CLI-facing mechanism) and git's own sample hooks. |
+
+**Net read:** this description matches GBrain's own feature set closely —
+the pluggable multi-KB engine, benchmark-optimized skills, and most of the
+fifth bullet (advisory generation, comprehensive audit, backfill,
+self-update) read as close paraphrases of GBrain's own documentation, not
+things DSH built or was ever asked to build as part of this design. DSH's
+CLI-orchestration and LLM-gateway capabilities are real and pre-existing
+(items 4 and part of 5) but narrower/differently named than described. None
+of the genuinely-missing items (multi-KB pluggable engine, skills
+benchmarking, system-wide audit, backfill, self-update) were adopted here —
+they fall outside this design's stated goal (§0: "a lightweight equivalent
+of GBrain," not a full reimplementation) and would be new scope, not a gap
+in what was already decided.
+
 ## 6. MCP and plugins: how features get added later
 
 The knowledge-hub plugin is deliberately not the only place new capability
@@ -845,7 +957,65 @@ Covered by `packages/mcp/mcp-client/tests/resources.spec.ts` (7 tests, real
 stdio fixture servers, one with a `resources` capability and one without) —
 99/99 tests pass across the package with zero regressions.
 
-## 7. What's explicitly out of scope
+## 8. Consolidation: closing the redundancy gap without reopening the black-box tradeoff
+
+**Implemented (2026-08-19).** §5.6/§5.3 rejected porting cognitiveBrain's
+daily/weekly/monthly L0→L1→L2 consolidation for two reasons: this plugin has
+no raw tier to distill (every note is already the final thing an agent chose
+to write), and an autonomous background job silently rewriting notes is
+exactly the "black box" quality the whole design exists to avoid. Both
+reasons hold — but they don't cover a real, narrower gap: a vault of small
+atomic notes accumulates redundancy over time regardless (the same fact
+restated across sessions, an old fact quietly contradicted by a newer one),
+and that's a genuine, distinct entropy problem neither reason addresses.
+
+**A brief investigation of GBrain's actual source** (`docs/gbrain-master`,
+a partial excerpt — an admin auth-scope file and a voice-assistant "recipe,"
+not the core engine) surfaced that GBrain's own synthesis need is closer to
+cognitiveBrain's than initially assumed: `context-builder.example.mjs`
+documents a real raw tier (`$BRAIN_ROOT/memory/YYYY-MM-DD.md`, appended
+through the day) feeding into synthesized artifacts (`SOUL.md`, a "stable
+emotional landscape"; `topics/<topicId>.md`, "recent turns + a 2-3 line
+synthesized summary... not a raw dump"). That's a genuinely different
+problem, though — giving a persistent voice-assistant persona continuity
+across calls — not "keep a searchable knowledge base free of redundant
+facts." Neither GBrain's nor cognitiveBrain's actual motivation is what
+this plugin needed to solve; the vault-entropy problem is narrower than
+both.
+
+**Resolved via `memory_consolidate`, an on-demand tool — not an autonomous
+job — built entirely from primitives this plugin already had:**
+
+- **`supersede`** proposals reuse `findContradiction` (§5.6) exactly as
+  written: two tag-overlapping notes whose content asserts opposite sides of
+  a negation pattern. `memory_consolidate` is the confirmation step §5.6
+  said `contradictedBy` was waiting on — that field is only ever written
+  once an agent explicitly calls this tool with `dryRun: false`, never
+  automatically.
+- **`merge`** proposals reuse the embeddings this plugin already computes at
+  write time (`embedding-cache.ts`): two or more tag-overlapping notes whose
+  cached embeddings are near-duplicates (cosine similarity ≥
+  `similarityThreshold`, default `0.92`), clustered via the same union-find
+  technique `concept-graph.ts`'s community detection already uses. Requires
+  `enableEmbeddings`; reports `mergeAvailable: false` and proposes no merges
+  otherwise, rather than silently doing nothing.
+
+**No new LLM call, no content ever rewritten.** Applying a proposal
+(`dryRun: false`, the default is a preview) only ever adds one frontmatter
+field, `supersededBy: <keepId>`, to the superseded note(s) — the file body,
+and the kept note's content, are never touched. Every application logs to
+the audit trail as an ordinary `update` operation, same as any other
+mutation — nothing about this ever runs invisibly, on a schedule, or
+without being asked. Superseded notes are hidden from `memory_recall`/
+`memory_related` (removed from the live search index, never re-indexed on
+the next boot) and from `memory_list`'s default view, but never deleted —
+`memory_list({ includeSuperseded: true })` still finds them, content fully
+intact. Covered by `consolidation.test.ts` (11 tests: contradiction/merge
+detection, tag-overlap prefiltering, multi-note cluster collapsing, the
+`mergeAvailable` gate) and `agent-chat-integration.test.ts` (dry-run vs.
+apply, audit-trail verification, real-embeddings merge).
+
+## 9. What's explicitly out of scope
 
 The automatic, per-query knowledge graph (`InProcessGraph`); the LLM
 enrichment pipeline; auto-synthesis / a compiled wiki (would need a fresh
@@ -853,7 +1023,57 @@ deterministic design, not adapted from `core/wiki/`); a file watcher for
 hand-edited notes (restart to pick up out-of-band edits); `memory_forget`,
 `memory_reindex`, `memory_get` tools; multi-source ingestion; chunking of
 note content for embeddings (chunking exists only for concept-graph
-extraction, §4.1); cross-device sync; a persisted on-disk index snapshot; and
-— a deliberate decision — any bulk/backfill tool to pull pre-existing or
-hand-written notes into the concept graph. Each is a stated boundary, not an
-oversight, so scope stays legible as this evolves.
+extraction, §4.1); cross-device sync; a persisted on-disk index snapshot;
+any bulk/backfill tool to pull pre-existing or hand-written notes into the
+concept graph; and any autonomous/scheduled trigger for
+`memory_consolidate` (§8) — it runs only when explicitly called. Each is a
+stated boundary, not an oversight, so scope stays legible as this evolves.
+
+## 10. Summary: what was adopted from cognitiveBrain and GBrain, and why
+
+The full evidence for each row below lives in the section cited; this table
+exists to answer one question in one place: *of everything either reference
+system does, what actually made it into `dsh-plugin-knowledge-hub`, and on
+what basis was that decided.*
+
+**The adoption criterion, applied consistently throughout:** keep a
+capability if it delivers real retrieval/audit value at a cost that's
+either zero, local, or bounded-and-opt-in; reject it if its cost is
+automatic/unbounded (every write, every query) or if it makes the vault a
+black box (content mutated or generated without a person or agent asking).
+Everything in the "Adopted" rows below satisfies the first; everything in
+"Rejected" fails the second.
+
+### From `docs/packages/cognitiveBrain` (§2)
+
+| Adopted | Rejected |
+|---|---|
+| `OramaIndex`'s hybrid BM25+vector engine → `memory-index.ts` (§2.1, §3.2) — real retrieval value, in-process, no server | `InProcessGraph` — automatic, traversed on every search call (§2.2) — the exact GBrain-style cost blowup |
+| `core/audit/*`'s append-only change-log pattern → `audit-log.ts` (§2.1, §3.3) — direct, cheap answer to "is memory auditable" | The LLM enrichment pipeline (10 processor stages) and `SynthesisEngine`/`MkdfAdapter` auto-synthesis (§2.2) — background mutation without being asked |
+| `ObsidianVaultProvider`'s local-fs + `.md`+frontmatter pattern → `vault-store.ts`/`frontmatter.ts` (§2.1) — matches "no database" directly, real YAML lib swapped in for its hand-rolled parser | The `core/wiki/*` subsystem (§2.2) — looked like a lean compiled-wiki fit by name, was actually the same graph+LLM-synthesis pattern in disguise |
+| `transformerOutputNormalizer` → `embedding.ts` (§2.1) — small, dependency-free, ported near-verbatim | Everything outside `memory/` — a browser-extension product and an unrelated mobile app, zero import relationship to a knowledge-hub concern (§2.2) |
+| `ConflictDetector`'s negation-pattern heuristic → `contradiction.ts` (§5.6) — LLM-free once its `entities[]` grouping was swapped for tag+similarity | — |
+
+### From GBrain (§5, §5.9, §6.1)
+
+| Adopted | Rejected |
+|---|---|
+| The **transport/security posture** for an outward MCP surface — bearer-token auth, IP/token rate limiting, loopback-vs-remote trust boundary — infrastructure, adopted directly for `dsh-plugins/mcp-server` (§6.1) | The **capability surface** GBrain's own MCP exposes beyond existing tools: auto-synthesis, query-time graph traversal, knowledge-gap analysis (§6.1) — the "Autonomous Cognition" tier, never scoped here |
+| The *lesson* of GBrain's 80+-tool bloat complaint → inverted into a hard constraint: exactly five tools (six after §8), sized to what's built, not a config flag (§3.4, §5.1) | Postgres/pgvector as the storage/retrieval backend (§5.1) — real capability, but reintroduces the opacity/dependency tradeoff this design exists to avoid |
+| — | A pluggable engine managing multiple simultaneous knowledge bases (§5.9) — not built; `knowledge-hub` is one vault, one engine |
+| — | Skills continuously optimized against benchmarks (§5.9) — no equivalent exists anywhere in DSH |
+| — | Advisory-recommendation generation, system-wide audit logging, backfill operations, self-update mechanisms (§5.9) — none exist in DSH; each would be new scope, not a gap being closed |
+
+**What this design added that neither source system has an equivalent
+for:** the concept graph's two-typed-edge (W1/W2) incremental, never-
+backfilled, opt-in design (§4, adapted from Tolaria's ADR-0175 —
+`docs/designKnowledgeGraph.md` §7 covers that adaptation the other
+direction) is closer to GBrain's structured-graph ambition than to anything
+in cognitiveBrain, but rebuilt from scratch with different cost guarantees
+(bounded per-note LLM cost vs. GBrain's per-query traversal cost). The
+opt-in per-query graph expansion (§4.4) and on-demand `memory_consolidate`
+(§8) are DSH-original answers to gaps both reference systems' own
+comparisons surfaced — a queryable graph and a redundancy-reduction
+mechanism — solved with primitives already in this plugin rather than by
+porting either system's actual mechanism (GBrain's `entity` verb,
+cognitiveBrain's L0→L1→L2 pipeline).

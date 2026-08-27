@@ -61,6 +61,7 @@ export function parseMemoryFile(raw: string, path: string): MemoryFile | undefin
   const sourceCount = typeof record.sourceCount === 'number' ? record.sourceCount : DEFAULT_SOURCE_COUNT
   const resource = isNonEmptyString(record.resource) || record.resource === null ? record.resource : undefined
   const contradictedBy = Array.isArray(record.contradictedBy) ? record.contradictedBy.filter(isNonEmptyString) : undefined
+  const supersededBy = isNonEmptyString(record.supersededBy) ? record.supersededBy : undefined
 
   const frontmatter: MemoryFrontmatter = {
     id,
@@ -73,6 +74,7 @@ export function parseMemoryFile(raw: string, path: string): MemoryFile | undefin
     ...(updatedAt === undefined ? {} : { updatedAt }),
     ...(resource === undefined ? {} : { resource }),
     ...(contradictedBy === undefined ? {} : { contradictedBy }),
+    ...(supersededBy === undefined ? {} : { supersededBy }),
   }
 
   return { frontmatter, content: split.body.trim(), path }
@@ -92,6 +94,7 @@ export function serializeMemoryFile(file: MemoryFile): string {
     confidence: frontmatter.confidence,
     sourceCount: frontmatter.sourceCount,
     ...(frontmatter.contradictedBy === undefined ? {} : { contradictedBy: frontmatter.contradictedBy }),
+    ...(frontmatter.supersededBy === undefined ? {} : { supersededBy: frontmatter.supersededBy }),
   }
   const yamlText = stringifyYaml(ordered).trimEnd()
   return `---\n${yamlText}\n---\n${file.content}\n`

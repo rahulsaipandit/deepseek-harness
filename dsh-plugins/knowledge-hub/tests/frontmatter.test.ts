@@ -24,7 +24,7 @@ describe('parseMemoryFile / serializeMemoryFile', () => {
     expect(parsed?.content).toBe(file.content)
   })
 
-  it('round-trips the optional resource and contradictedBy fields', () => {
+  it('round-trips the optional resource, contradictedBy, and supersededBy fields', () => {
     const file: MemoryFile = {
       frontmatter: {
         id: 'mem_okf',
@@ -36,6 +36,7 @@ describe('parseMemoryFile / serializeMemoryFile', () => {
         sourceCount: 1,
         resource: 'https://example.com/source',
         contradictedBy: ['mem_other'],
+        supersededBy: 'mem_newer',
       },
       content: 'Body.',
       path: '/tmp/mem_okf.md',
@@ -44,6 +45,7 @@ describe('parseMemoryFile / serializeMemoryFile', () => {
     const parsed = parseMemoryFile(raw, file.path)
     expect(parsed?.frontmatter.resource).toBe('https://example.com/source')
     expect(parsed?.frontmatter.contradictedBy).toEqual(['mem_other'])
+    expect(parsed?.frontmatter.supersededBy).toBe('mem_newer')
   })
 
   it('round-trips a null resource', () => {
@@ -66,11 +68,12 @@ describe('parseMemoryFile / serializeMemoryFile', () => {
     expect(parsed?.frontmatter.resource).toBeNull()
   })
 
-  it('leaves resource and contradictedBy undefined when absent', () => {
+  it('leaves resource, contradictedBy, and supersededBy undefined when absent', () => {
     const raw = `---\nid: mem_4\ntitle: Minimal\ntype: note\ncreatedAt: "2026-08-18T10:00:00.000Z"\n---\nBody.\n`
     const parsed = parseMemoryFile(raw, '/tmp/mem_4.md')
     expect(parsed?.frontmatter.resource).toBeUndefined()
     expect(parsed?.frontmatter.contradictedBy).toBeUndefined()
+    expect(parsed?.frontmatter.supersededBy).toBeUndefined()
   })
 
   it('defaults confidence and sourceCount, and tags to []', () => {
