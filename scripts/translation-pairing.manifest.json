@@ -7,6 +7,17 @@
     "docs/cordis-api/inherited.md",
     "docs/i18n/style-samples.md",
     "docs/i18n/terminology.md",
-    "docs/i18n/translation-prompt.md"
+    "docs/i18n/translation-prompt.md",
+    "dsh-plugins/",
+    "docs/packages/",
+    "docs/CompareTools.md",
+    "docs/adr/rp_dshPlugins.md",
+    "docs/agenticHarness.md",
+    "docs/designCabinetButForSingleUser.md",
+    "docs/designCognitiveBrainForDSH.md",
+    "docs/designKnowledgeGraph.md",
+    "docs/dsh-base-bundle-boot-hang.md",
+    "docs/fork-history.md",
+    "docs/oldCognitiveBrain.md"
   ]
 }

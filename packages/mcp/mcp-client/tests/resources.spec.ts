@@ -11,7 +11,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
-import { CallId } from '@deepseek-ai/dsh-llm'
+import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import { apply } from '@deepseek-ai/dsh-mcp-client/src/index.ts'
 import type { Config } from '@deepseek-ai/dsh-mcp-client'
 
@@ -34,8 +34,8 @@ function sleep(ms: number): Promise<void> {
 }
 
 let callSeq = 0
-function nextCallId(): CallId {
-  return CallId(`resources-e2e-${++callSeq}`)
+function nextCallId(): ToolCallId {
+  return ToolCallId(`resources-e2e-${++callSeq}`)
 }
 
 describe('resources bridge — server that supports resources', () => {

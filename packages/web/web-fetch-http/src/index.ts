@@ -1,8 +1,6 @@
 /**
- * `@deepseek-ai/dsh-web-fetch-http`: registers an anonymous public HTTP(S)
- * `WebFetchProvider` with `ctx.web`. A function/namespace plugin (NOT a
- * default-export service): it registers INTO the seam's fetch registry, like the
- * search providers register into the search registry.
+ * Anonymous public HTTP(S) `WebFetchProvider` plugin. It contributes to the
+ * `ctx.web` registry without owning the service.
  *
  * @module @deepseek-ai/dsh-web-fetch-http
  */
@@ -12,7 +10,6 @@ import z from '@deepseek-ai/schemastery'
 import type {} from '@deepseek-ai/dsh-web'
 import { HttpFetchProvider } from './provider.ts'
 import type { HttpFetchLimits } from './provider.ts'
-import type { DestinationPolicyMode } from './policy.ts'
 
 const MAX_NODE_TIMER_DELAY_MS = 2_147_483_647
 
@@ -20,7 +17,7 @@ export {
   LOCAL_FETCH_PROVIDER_ID,
   HttpFetchProvider,
 } from './provider.ts'
-export type { HttpFetchLimits } from './provider.ts'
+export type { HttpFetchLimits, HttpFetchResolver } from './provider.ts'
 
 /** Default `User-Agent`: an explicit product agent, never a browser disguise. */
 export const DEFAULT_USER_AGENT = 'deepseek-harness/0.0.1 (+https://github.com/deepseek-ai)'
@@ -33,8 +30,6 @@ export const inject = ['web']
 
 /** Plugin config: the provider's transport and size limits plus its `User-Agent` (all defaulted). */
 export interface Config {
-  /** Maximum accepted request URL length. */
-  maxUrlLength?: number
   /** Maximum response body size in bytes. */
   maxResponseBytes?: number
   /** Maximum decoded body length in characters. */
@@ -45,24 +40,14 @@ export interface Config {
   maxRedirects?: number
   /** `User-Agent` header sent on every request. */
   userAgent?: string
-  /** Destination policy applied after DNS resolution for each request hop. */
-  destinationPolicyMode?: DestinationPolicyMode
-  /** CIDR allowlist used when `destinationPolicyMode` is `allowlist`. */
-  destinationAllowCidrs?: string[]
 }
 
 export const Config: z<Config> = z.object({
-  maxUrlLength: z.number().default(2048),
   maxResponseBytes: z.number().default(5_000_000),
   maxBodyChars: z.number().default(100_000),
   timeoutMs: z.number().default(30_000),
   maxRedirects: z.number().default(5),
   userAgent: z.string().default(DEFAULT_USER_AGENT),
-  destinationPolicyMode: z.union([
-    z.const('block-private'),
-    z.const('allowlist'),
-  ]).default('block-private'),
-  destinationAllowCidrs: z.array(String).default([]),
 })
 
 /** Complete config after schemastery applies every field default. */
@@ -90,31 +75,20 @@ function assertNonNegativeInteger(name: string, value: number): void {
   }
 }
 
-function assertDestinationPolicy(config: ResolvedConfig): void {
-  if (config.destinationPolicyMode === 'allowlist' && config.destinationAllowCidrs.length === 0) {
-    throw new Error('web-fetch-http: destinationAllowCidrs must be non-empty in allowlist mode')
-  }
-}
-
 /** Register the local HTTP(S) fetch provider with `ctx.web`. */
 export function apply(ctx: Context, config: Config): void {
   // schemastery (Config) has already filled every defaulted field.
   const resolved = config as ResolvedConfig
-  assertPositiveFinite('maxUrlLength', resolved.maxUrlLength)
   assertPositiveFinite('maxResponseBytes', resolved.maxResponseBytes)
   assertPositiveFinite('maxBodyChars', resolved.maxBodyChars)
   assertTimeoutMs(resolved.timeoutMs)
   assertNonNegativeInteger('maxRedirects', resolved.maxRedirects)
-  assertDestinationPolicy(resolved)
   const limits: HttpFetchLimits = {
-    maxUrlLength: resolved.maxUrlLength,
     maxResponseBytes: resolved.maxResponseBytes,
     maxBodyChars: resolved.maxBodyChars,
     timeoutMs: resolved.timeoutMs,
     maxRedirects: resolved.maxRedirects,
     userAgent: resolved.userAgent,
-    destinationPolicyMode: resolved.destinationPolicyMode,
-    destinationAllowCidrs: resolved.destinationAllowCidrs,
   }
   ctx.web.registerFetchProvider(new HttpFetchProvider(limits))
 }
