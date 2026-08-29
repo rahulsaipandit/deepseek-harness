@@ -37,6 +37,17 @@ without depending on this monorepo's internal build.
   `docs/adr/rp_dshPlugin_imChat.md` for the design, the community plugins it
   learned from without adopting wholesale, and current adapter status
   (Telegram and Slack implemented against mock APIs, WhatsApp deferred).
+- **[social-capture](./social-capture/)** — receives social-media posts
+  captured by a per-user browser bookmarklet/console-script (reading a
+  page's own Open Graph meta tags in the user's already-logged-in tab) and
+  writes them into a `dsh-plugin-knowledge-hub` vault as searchable notes.
+  In-house design, not a port — see its README and
+  `docs/designSocialCaptureForDSH.md` for why this replaces a
+  Playwright-driven login flow (no browser-automation capability exists in
+  DSH, and having the harness hold platform credentials/session cookies was
+  rejected as unnecessary blast radius) with the pattern
+  [Siftly](https://github.com/viperrcrypto/Siftly) uses for Twitter/X
+  bookmarks.
 - **[skillhub](./skillhub/)** — `skillhub_search`/`install`/`list`/`uninstall`
   tools that discover and manage skills from a configured registry, a
   hardened take on the community
